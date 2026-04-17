@@ -1088,12 +1088,15 @@ def render_input_page(user):
     else:
         st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
 
-    st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
-    st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
+    # 保存/更新だけ別フォームに隔離する
+    with st.form(key=f"save_form_{st.session_state.form_version}", clear_on_submit=False):
+        st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
+        st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
 
-    button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
+        button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
+        submitted = st.form_submit_button(button_label, type="primary")
 
-    if st.button(button_label, type="primary", key=f"save_btn_{st.session_state.form_version}"):
+    if submitted:
         workout_date = st.session_state[entry_key("workout_date")]
         category = st.session_state[entry_key("category")]
         exercise = st.session_state[entry_key("exercise")]

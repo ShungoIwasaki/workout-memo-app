@@ -3,10 +3,11 @@ import sqlite3
 import hashlib
 from datetime import date, datetime, timedelta
 
+import pandas as pd
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -192,19 +193,6 @@ def get_conn():
     return conn
 
 
-def get_table_columns(table_name):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table_name})")
-    rows = cur.fetchall()
-    conn.close()
-    return [row["name"] for row in rows]
-
-
-def column_exists(table_name, column_name):
-    return column_name in get_table_columns(table_name)
-
-
 def utcnow():
     return datetime.utcnow()
 
@@ -215,36 +203,6 @@ def infer_category_from_exercise(exercise):
         if exercise in exercises:
             return category
     return list(EXERCISE_MASTER.keys())[0]
-
-
-def format_number_for_input(value):
-    try:
-        f = float(value)
-        if f.is_integer():
-            return str(int(f))
-        return str(f)
-    except Exception:
-        return "0"
-
-
-def parse_float_input(value):
-    s = str(value).strip()
-    if s == "":
-        return 0.0, False
-    try:
-        return float(s), True
-    except Exception:
-        return 0.0, False
-
-
-def parse_int_input(value):
-    s = str(value).strip()
-    if s == "":
-        return 0, False
-    try:
-        return int(float(s)), True
-    except Exception:
-        return 0, False
 
 
 def init_db():
@@ -313,29 +271,6 @@ def init_db():
     )
 
     conn.commit()
-
-    if not column_exists("users", "height_cm"):
-        cur.execute("ALTER TABLE users ADD COLUMN height_cm REAL")
-    if not column_exists("users", "body_weight_kg"):
-        cur.execute("ALTER TABLE users ADD COLUMN body_weight_kg REAL")
-
-    if not column_exists("workouts", "category"):
-        cur.execute("ALTER TABLE workouts ADD COLUMN category TEXT NOT NULL DEFAULT ''")
-    if not column_exists("workouts", "rest_seconds"):
-        cur.execute("ALTER TABLE workouts ADD COLUMN rest_seconds INTEGER NOT NULL DEFAULT 90")
-    if not column_exists("workouts", "rating"):
-        cur.execute("ALTER TABLE workouts ADD COLUMN rating TEXT NOT NULL DEFAULT '△'")
-    if not column_exists("workouts", "workout_note"):
-        cur.execute("ALTER TABLE workouts ADD COLUMN workout_note TEXT")
-
-    if not column_exists("workout_sets", "is_warmup"):
-        cur.execute("ALTER TABLE workout_sets ADD COLUMN is_warmup INTEGER NOT NULL DEFAULT 0")
-    if not column_exists("workout_sets", "rest_seconds"):
-        cur.execute("ALTER TABLE workout_sets ADD COLUMN rest_seconds INTEGER NOT NULL DEFAULT 0")
-    if not column_exists("workout_sets", "set_note"):
-        cur.execute("ALTER TABLE workout_sets ADD COLUMN set_note TEXT DEFAULT ''")
-
-    conn.commit()
     conn.close()
 
 
@@ -377,7 +312,6 @@ def create_session(user_id, hours=SESSION_HOURS):
 def delete_session(token):
     if not token:
         return
-
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
@@ -487,6 +421,49 @@ def update_user_profile(user_id, display_name, height_cm, body_weight_kg):
     conn.commit()
     conn.close()
     return True, "プロフィールを更新しました。"
+
+
+def get_workouts_for_user(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM workouts
+        WHERE user_id = ?
+        ORDER BY workout_date DESC, id DESC
+        """,
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_workout_by_id(workout_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM workouts WHERE id = ?", (workout_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_sets_for_workout(workout_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT *
+        FROM workout_sets
+        WHERE workout_id = ?
+        ORDER BY set_no ASC
+        """,
+        (workout_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def save_workout(user_id, workout_date, category, exercise, rest_seconds, rating, workout_note, sets_data):
@@ -607,49 +584,6 @@ def delete_workout(workout_id):
     conn.close()
 
 
-def get_workouts_for_user(user_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT *
-        FROM workouts
-        WHERE user_id = ?
-        ORDER BY workout_date DESC, id DESC
-        """,
-        (user_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_workout_by_id(workout_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM workouts WHERE id = ?", (workout_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_sets_for_workout(workout_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT *
-        FROM workout_sets
-        WHERE workout_id = ?
-        ORDER BY set_no ASC
-        """,
-        (workout_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
 def get_latest_same_exercise(user_id, exercise, exclude_workout_id=None):
     exercise = (exercise or "").strip()
     if not exercise or exercise == EXERCISE_PLACEHOLDER:
@@ -718,44 +652,142 @@ def estimate_1rm_brzycki(weight, reps_unassisted):
 
 def best_estimated_1rm(sets_data):
     candidates = []
-
     for s in sets_data:
-        if s.get("is_warmup"):
+        if s["is_warmup"]:
             continue
-
-        est = estimate_1rm_brzycki(
-            float(s["weight"]),
-            int(s["reps_unassisted"]),
-        )
+        est = estimate_1rm_brzycki(float(s["weight"]), int(s["reps_unassisted"]))
         if est is not None:
             candidates.append((est, s))
-
     if not candidates:
         return None, None
-
     return max(candidates, key=lambda x: x[0])
 
 
-def default_set():
+def get_exercise_met(category, exercise):
+    if exercise in EXERCISE_METS:
+        return EXERCISE_METS[exercise]
+    if category in CATEGORY_DEFAULT_MET:
+        return CATEGORY_DEFAULT_MET[category]
+    return 5.0
+
+
+def calculate_workout_metrics(workout, sets_rows, body_weight_kg):
+    total_load = 0.0
+    main_load = 0.0
+    total_sets = len(sets_rows)
+    total_reps = 0
+    main_sets = 0
+    active_seconds = 0
+
+    for row in sets_rows:
+        reps = int(row["reps_unassisted"]) + int(row["reps_assisted"])
+        load = float(row["weight"]) * reps
+        total_load += load
+        total_reps += reps
+        active_seconds += reps * 4
+        if not bool(row["is_warmup"]):
+            main_load += load
+            main_sets += 1
+
+    rest_intervals = max(total_sets - 1, 0)
+    total_seconds = active_seconds + int(workout["rest_seconds"]) * rest_intervals
+
+    met = get_exercise_met(
+        workout["category"] or infer_category_from_exercise(workout["exercise"]),
+        workout["exercise"],
+    )
+
+    est_kcal = None
+    if body_weight_kg is not None and body_weight_kg > 0:
+        est_kcal = met * body_weight_kg * (total_seconds / 3600)
+
     return {
-        "weight": "0",
-        "reps_unassisted": "0",
-        "reps_assisted": "0",
-        "is_warmup": False,
+        "total_load": total_load,
+        "main_load": main_load,
+        "total_sets": total_sets,
+        "total_reps": total_reps,
+        "est_kcal": est_kcal,
     }
+
+
+def calculate_daily_summary(entries):
+    summary = {
+        "total_load": 0.0,
+        "main_load": 0.0,
+        "total_sets": 0,
+        "total_reps": 0,
+        "est_kcal": 0.0,
+        "has_kcal": True,
+    }
+
+    for entry in entries:
+        metrics = entry["metrics"]
+        summary["total_load"] += metrics["total_load"]
+        summary["main_load"] += metrics["main_load"]
+        summary["total_sets"] += metrics["total_sets"]
+        summary["total_reps"] += metrics["total_reps"]
+
+        if metrics["est_kcal"] is None:
+            summary["has_kcal"] = False
+        else:
+            summary["est_kcal"] += metrics["est_kcal"]
+
+    return summary
+
+
+def default_sets_df():
+    return pd.DataFrame(
+        [
+            {
+                "is_warmup": False,
+                "weight": 0.0,
+                "reps_unassisted": 0,
+                "reps_assisted": 0,
+            }
+        ]
+    )
+
+
+def normalize_sets_df(df):
+    if df is None or len(df) == 0:
+        return default_sets_df()
+
+    df = df.copy()
+
+    for col in ["is_warmup", "weight", "reps_unassisted", "reps_assisted"]:
+        if col not in df.columns:
+            if col == "is_warmup":
+                df[col] = False
+            else:
+                df[col] = 0
+
+    df = df[["is_warmup", "weight", "reps_unassisted", "reps_assisted"]]
+
+    df["is_warmup"] = df["is_warmup"].fillna(False).astype(bool)
+    df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0)
+    df["reps_unassisted"] = pd.to_numeric(df["reps_unassisted"], errors="coerce").fillna(0).astype(int)
+    df["reps_assisted"] = pd.to_numeric(df["reps_assisted"], errors="coerce").fillna(0).astype(int)
+
+    if len(df) == 0:
+        return default_sets_df()
+
+    return df.reset_index(drop=True)
+
+
+def df_to_sets(df):
+    df = normalize_sets_df(df)
+    return df.to_dict("records")
 
 
 def ensure_app_state():
     if "current_user" not in st.session_state:
         st.session_state.current_user = None
-    if "form_version" not in st.session_state:
-        st.session_state.form_version = 0
-    if "set_count" not in st.session_state:
-        st.session_state.set_count = 1
-    if "editing_workout_id" not in st.session_state:
-        st.session_state.editing_workout_id = None
     if "page" not in st.session_state:
         st.session_state.page = "入力"
+    if "editing_workout_id" not in st.session_state:
+        st.session_state.editing_workout_id = None
+    if "form_version" not in st.session_state:
+        st.session_state.form_version = 0
     if "flash_message" not in st.session_state:
         st.session_state.flash_message = None
 
@@ -764,27 +796,56 @@ def entry_key(name):
     return f"{name}_{st.session_state.form_version}"
 
 
-def set_key(name, index):
-    return f"{name}_{st.session_state.form_version}_{index}"
+def editor_data_key():
+    return f"sets_data_{st.session_state.form_version}"
 
 
-def ensure_category_exercise_state():
-    category_key = entry_key("category")
-    exercise_key = entry_key("exercise")
+def editor_widget_key():
+    return f"sets_editor_{st.session_state.form_version}"
 
-    valid_categories = list(EXERCISE_MASTER.keys())
 
-    current_category = st.session_state.get(category_key, CATEGORY_PLACEHOLDER)
-    if current_category not in valid_categories:
-        st.session_state[category_key] = CATEGORY_PLACEHOLDER
-        st.session_state[exercise_key] = EXERCISE_PLACEHOLDER
-        return
+def reset_entry_form(preserve_date=None, preserve_rest=None):
+    st.session_state.form_version += 1
+    st.session_state.editing_workout_id = None
 
-    exercise_options = EXERCISE_MASTER[current_category]
-    current_exercise = st.session_state.get(exercise_key, EXERCISE_PLACEHOLDER)
+    st.session_state[entry_key("workout_date")] = preserve_date if preserve_date is not None else date.today()
+    st.session_state[entry_key("category")] = CATEGORY_PLACEHOLDER
+    st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
+    st.session_state[entry_key("rest_seconds")] = int(preserve_rest) if preserve_rest is not None else 90
+    st.session_state[entry_key("rating")] = "△"
+    st.session_state[entry_key("workout_note")] = ""
+    st.session_state[editor_data_key()] = default_sets_df()
 
-    if current_exercise not in exercise_options:
-        st.session_state[exercise_key] = EXERCISE_PLACEHOLDER
+
+def load_workout_into_form(workout_id):
+    workout = get_workout_by_id(workout_id)
+    sets_rows = get_sets_for_workout(workout_id)
+
+    st.session_state.form_version += 1
+    st.session_state.editing_workout_id = workout_id
+
+    category = workout["category"] or infer_category_from_exercise(workout["exercise"])
+
+    st.session_state[entry_key("workout_date")] = datetime.strptime(workout["workout_date"], "%Y-%m-%d").date()
+    st.session_state[entry_key("category")] = category
+    st.session_state[entry_key("exercise")] = workout["exercise"]
+    st.session_state[entry_key("rest_seconds")] = int(workout["rest_seconds"])
+    st.session_state[entry_key("rating")] = workout["rating"] if workout["rating"] in ["〇", "△", "×"] else "△"
+    st.session_state[entry_key("workout_note")] = workout["workout_note"] or ""
+
+    df = pd.DataFrame(
+        [
+            {
+                "is_warmup": bool(row["is_warmup"]),
+                "weight": float(row["weight"]),
+                "reps_unassisted": int(row["reps_unassisted"]),
+                "reps_assisted": int(row["reps_assisted"]),
+            }
+            for row in sets_rows
+        ]
+    )
+
+    st.session_state[editor_data_key()] = normalize_sets_df(df)
 
 
 def ensure_form_defaults():
@@ -800,174 +861,8 @@ def ensure_form_defaults():
         st.session_state[entry_key("rating")] = "△"
     if entry_key("workout_note") not in st.session_state:
         st.session_state[entry_key("workout_note")] = ""
-
-    ensure_category_exercise_state()
-
-    for i in range(st.session_state.set_count):
-        d = default_set()
-        for field, value in d.items():
-            key = set_key(field, i)
-            if key not in st.session_state:
-                st.session_state[key] = value
-
-
-def read_set_from_state(index):
-    raw_weight = st.session_state.get(set_key("weight", index), "0")
-    raw_reps_unassisted = st.session_state.get(set_key("reps_unassisted", index), "0")
-    raw_reps_assisted = st.session_state.get(set_key("reps_assisted", index), "0")
-
-    weight, ok_weight = parse_float_input(raw_weight)
-    reps_unassisted, ok_reps_unassisted = parse_int_input(raw_reps_unassisted)
-    reps_assisted, ok_reps_assisted = parse_int_input(raw_reps_assisted)
-
-    return {
-        "weight": weight,
-        "reps_unassisted": reps_unassisted,
-        "reps_assisted": reps_assisted,
-        "is_warmup": bool(st.session_state.get(set_key("is_warmup", index), False)),
-        "_raw_weight": raw_weight,
-        "_raw_reps_unassisted": raw_reps_unassisted,
-        "_raw_reps_assisted": raw_reps_assisted,
-        "_valid": ok_weight and ok_reps_unassisted and ok_reps_assisted,
-    }
-
-
-def get_current_sets():
-    return [read_set_from_state(i) for i in range(st.session_state.set_count)]
-
-
-def collect_header_from_state():
-    ensure_category_exercise_state()
-
-    return {
-        "workout_date": st.session_state.get(entry_key("workout_date"), date.today()),
-        "category": st.session_state.get(entry_key("category"), CATEGORY_PLACEHOLDER),
-        "exercise": st.session_state.get(entry_key("exercise"), EXERCISE_PLACEHOLDER),
-        "rest_seconds": st.session_state.get(entry_key("rest_seconds"), 90),
-        "rating": st.session_state.get(entry_key("rating"), "△"),
-        "workout_note": st.session_state.get(entry_key("workout_note"), ""),
-    }
-
-
-def load_form_data(header, sets_data, editing_id=None):
-    st.session_state.form_version += 1
-    st.session_state.editing_workout_id = editing_id
-    st.session_state.set_count = max(len(sets_data), 1)
-
-    st.session_state[entry_key("workout_date")] = header["workout_date"]
-    st.session_state[entry_key("category")] = header["category"]
-    st.session_state[entry_key("rest_seconds")] = int(header["rest_seconds"])
-    st.session_state[entry_key("rating")] = header["rating"]
-    st.session_state[entry_key("workout_note")] = header["workout_note"]
-
-    category = header["category"]
-    if category in EXERCISE_MASTER:
-        exercise_options = EXERCISE_MASTER[category]
-        exercise = header["exercise"]
-        if exercise not in exercise_options:
-            exercise = EXERCISE_PLACEHOLDER
-        st.session_state[entry_key("exercise")] = exercise
-    else:
-        st.session_state[entry_key("category")] = CATEGORY_PLACEHOLDER
-        st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
-
-    normalized_sets = sets_data[:]
-    while len(normalized_sets) < st.session_state.set_count:
-        normalized_sets.append(default_set())
-
-    for i, s in enumerate(normalized_sets):
-        st.session_state[set_key("weight", i)] = format_number_for_input(s["weight"])
-        st.session_state[set_key("reps_unassisted", i)] = format_number_for_input(s["reps_unassisted"])
-        st.session_state[set_key("reps_assisted", i)] = format_number_for_input(s["reps_assisted"])
-        st.session_state[set_key("is_warmup", i)] = bool(s["is_warmup"])
-
-
-def add_new_set(copy_from_index=None):
-    header = collect_header_from_state()
-    sets_data = get_current_sets()
-
-    if copy_from_index is None:
-        sets_data.append(default_set())
-    else:
-        copied = sets_data[copy_from_index]
-        sets_data.append(
-            {
-                "weight": copied["_raw_weight"],
-                "reps_unassisted": copied["_raw_reps_unassisted"],
-                "reps_assisted": copied["_raw_reps_assisted"],
-                "is_warmup": copied["is_warmup"],
-            }
-        )
-
-    load_form_data(header, sets_data, st.session_state.editing_workout_id)
-
-
-def remove_set(index):
-    sets_data = get_current_sets()
-    if len(sets_data) <= 1:
-        return
-
-    header = collect_header_from_state()
-    new_sets = []
-    for i, s in enumerate(sets_data):
-        if i != index:
-            new_sets.append(
-                {
-                    "weight": s["_raw_weight"],
-                    "reps_unassisted": s["_raw_reps_unassisted"],
-                    "reps_assisted": s["_raw_reps_assisted"],
-                    "is_warmup": s["is_warmup"],
-                }
-            )
-
-    load_form_data(header, new_sets, st.session_state.editing_workout_id)
-
-
-def reset_entry_form(preserve_date=None, preserve_rest=None):
-    st.session_state.form_version += 1
-    st.session_state.set_count = 1
-    st.session_state.editing_workout_id = None
-
-    st.session_state[entry_key("workout_date")] = preserve_date if preserve_date is not None else date.today()
-    st.session_state[entry_key("rest_seconds")] = int(preserve_rest) if preserve_rest is not None else 90
-    st.session_state[entry_key("category")] = CATEGORY_PLACEHOLDER
-    st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
-    st.session_state[entry_key("rating")] = "△"
-    st.session_state[entry_key("workout_note")] = ""
-
-    st.session_state[set_key("weight", 0)] = "0"
-    st.session_state[set_key("reps_unassisted", 0)] = "0"
-    st.session_state[set_key("reps_assisted", 0)] = "0"
-    st.session_state[set_key("is_warmup", 0)] = False
-
-
-def load_workout_into_form(workout_id):
-    workout = get_workout_by_id(workout_id)
-    sets_rows = get_sets_for_workout(workout_id)
-
-    category = workout["category"] or infer_category_from_exercise(workout["exercise"])
-
-    header = {
-        "workout_date": datetime.strptime(workout["workout_date"], "%Y-%m-%d").date(),
-        "category": category,
-        "exercise": workout["exercise"],
-        "rest_seconds": int(workout["rest_seconds"]),
-        "rating": workout["rating"] if workout["rating"] in ["〇", "△", "×"] else "△",
-        "workout_note": workout["workout_note"] or "",
-    }
-
-    sets_data = []
-    for row in sets_rows:
-        sets_data.append(
-            {
-                "weight": format_number_for_input(row["weight"]),
-                "reps_unassisted": format_number_for_input(row["reps_unassisted"]),
-                "reps_assisted": format_number_for_input(row["reps_assisted"]),
-                "is_warmup": bool(row["is_warmup"]),
-            }
-        )
-
-    load_form_data(header, sets_data, editing_id=workout_id)
+    if editor_data_key() not in st.session_state:
+        st.session_state[editor_data_key()] = default_sets_df()
 
 
 def get_user_body_weight_kg(user):
@@ -981,93 +876,6 @@ def get_user_body_weight_kg(user):
     if value <= 0:
         return None
     return value
-
-
-def get_exercise_met(category, exercise):
-    if exercise in EXERCISE_METS:
-        return EXERCISE_METS[exercise]
-    if category in CATEGORY_DEFAULT_MET:
-        return CATEGORY_DEFAULT_MET[category]
-    return 5.0
-
-
-def calculate_workout_metrics(workout, sets_rows, body_weight_kg):
-    total_load = 0.0
-    main_load = 0.0
-    total_sets = len(sets_rows)
-    main_sets = 0
-    total_reps = 0
-    main_reps = 0
-    active_seconds = 0
-
-    for row in sets_rows:
-        reps = int(row["reps_unassisted"]) + int(row["reps_assisted"])
-        load = float(row["weight"]) * reps
-        is_warmup = bool(row["is_warmup"])
-
-        total_load += load
-        total_reps += reps
-        active_seconds += reps * 4
-
-        if not is_warmup:
-            main_load += load
-            main_reps += reps
-            main_sets += 1
-
-    rest_intervals = max(total_sets - 1, 0)
-    total_seconds = active_seconds + int(workout["rest_seconds"]) * rest_intervals
-
-    met = get_exercise_met(
-        workout["category"] or infer_category_from_exercise(workout["exercise"]),
-        workout["exercise"],
-    )
-
-    if body_weight_kg is not None and body_weight_kg > 0:
-        est_kcal = met * body_weight_kg * (total_seconds / 3600)
-    else:
-        est_kcal = None
-
-    return {
-        "total_load": total_load,
-        "main_load": main_load,
-        "total_sets": total_sets,
-        "main_sets": main_sets,
-        "total_reps": total_reps,
-        "main_reps": main_reps,
-        "active_seconds": active_seconds,
-        "total_seconds": total_seconds,
-        "est_kcal": est_kcal,
-        "met": met,
-    }
-
-
-def calculate_daily_summary(entries):
-    summary = {
-        "total_load": 0.0,
-        "main_load": 0.0,
-        "total_sets": 0,
-        "main_sets": 0,
-        "total_reps": 0,
-        "main_reps": 0,
-        "est_kcal": 0.0,
-        "has_kcal": True,
-    }
-
-    for entry in entries:
-        metrics = entry["metrics"]
-        summary["total_load"] += metrics["total_load"]
-        summary["main_load"] += metrics["main_load"]
-        summary["total_sets"] += metrics["total_sets"]
-        summary["main_sets"] += metrics["main_sets"]
-        summary["total_reps"] += metrics["total_reps"]
-        summary["main_reps"] += metrics["main_reps"]
-
-        if metrics["est_kcal"] is None:
-            summary["has_kcal"] = False
-        else:
-            summary["est_kcal"] += metrics["est_kcal"]
-
-    return summary
 
 
 def render_previous_exercise_summary(user_id, exercise, exclude_workout_id=None):
@@ -1105,53 +913,6 @@ def render_previous_exercise_summary(user_id, exercise, exclude_workout_id=None)
     )
 
 
-def render_set_block(i):
-    with st.expander(f"Set {i + 1}", expanded=True):
-        st.checkbox(
-            "ウォームアップ",
-            key=set_key("is_warmup", i),
-        )
-        st.text_input(
-            "重さ (kg)",
-            key=set_key("weight", i),
-            placeholder="例: 20 / 20.5",
-        )
-        st.text_input(
-            "回数（補助なし）",
-            key=set_key("reps_unassisted", i),
-            placeholder="例: 8",
-        )
-        st.text_input(
-            "回数（補助あり）",
-            key=set_key("reps_assisted", i),
-            placeholder="例: 2",
-        )
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button(
-                "コピー追加",
-                key=f"copy_{st.session_state.form_version}_{i}",
-            ):
-                add_new_set(copy_from_index=i)
-                st.rerun()
-        with c2:
-            if st.button(
-                "空で追加",
-                key=f"blank_{st.session_state.form_version}_{i}",
-            ):
-                add_new_set(copy_from_index=None)
-                st.rerun()
-        with c3:
-            if st.button(
-                "このセット削除",
-                key=f"remove_{st.session_state.form_version}_{i}",
-                disabled=(st.session_state.set_count <= 1),
-            ):
-                remove_set(i)
-                st.rerun()
-
-
 def render_input_page(user):
     if st.session_state.editing_workout_id is not None:
         st.warning("現在、既存記録を修正中です。")
@@ -1164,11 +925,7 @@ def render_input_page(user):
     st.date_input("日付", key=entry_key("workout_date"))
 
     category_options = [CATEGORY_PLACEHOLDER] + list(EXERCISE_MASTER.keys())
-    st.selectbox(
-        "カテゴリ",
-        category_options,
-        key=entry_key("category"),
-    )
+    st.selectbox("カテゴリ", category_options, key=entry_key("category"))
 
     selected_category = st.session_state[entry_key("category")]
 
@@ -1181,18 +938,8 @@ def render_input_page(user):
         if current_exercise not in exercise_options:
             st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
 
-    st.selectbox(
-        "種目",
-        exercise_options,
-        key=entry_key("exercise"),
-    )
-
-    st.number_input(
-        "レスト (秒)",
-        min_value=0,
-        step=5,
-        key=entry_key("rest_seconds"),
-    )
+    st.selectbox("種目", exercise_options, key=entry_key("exercise"))
+    st.number_input("レスト (秒)", min_value=0, step=5, key=entry_key("rest_seconds"))
 
     selected_exercise = st.session_state[entry_key("exercise")].strip()
     if (
@@ -1207,10 +954,41 @@ def render_input_page(user):
 
     st.subheader("セット入力")
 
-    for i in range(st.session_state.set_count):
-        render_set_block(i)
+    current_df = normalize_sets_df(st.session_state[editor_data_key()])
 
-    current_sets = get_current_sets()
+    edited_df = st.data_editor(
+        current_df,
+        key=editor_widget_key(),
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "is_warmup": st.column_config.CheckboxColumn("ウォームアップ"),
+            "weight": st.column_config.NumberColumn("重さ (kg)", min_value=0.0, step=2.5, format="%.2f"),
+            "reps_unassisted": st.column_config.NumberColumn("回数（補助なし）", min_value=0, step=1),
+            "reps_assisted": st.column_config.NumberColumn("回数（補助あり）", min_value=0, step=1),
+        },
+    )
+
+    edited_df = normalize_sets_df(pd.DataFrame(edited_df))
+    st.session_state[editor_data_key()] = edited_df
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("最後のセットをコピー追加", key=f"copy_last_{st.session_state.form_version}"):
+            source_df = normalize_sets_df(st.session_state[editor_data_key()])
+            last_row = source_df.iloc[-1].to_dict()
+            source_df = pd.concat([source_df, pd.DataFrame([last_row])], ignore_index=True)
+            st.session_state[editor_data_key()] = normalize_sets_df(source_df)
+            st.rerun()
+    with c2:
+        if st.button("最後のセットを削除", key=f"remove_last_{st.session_state.form_version}", disabled=len(edited_df) <= 1):
+            source_df = normalize_sets_df(st.session_state[editor_data_key()])
+            source_df = source_df.iloc[:-1].reset_index(drop=True)
+            st.session_state[editor_data_key()] = normalize_sets_df(source_df)
+            st.rerun()
+
+    current_sets = df_to_sets(st.session_state[editor_data_key()])
     best_1rm, best_set = best_estimated_1rm(current_sets)
 
     if best_1rm is not None and best_set is not None:
@@ -1228,18 +1006,8 @@ def render_input_page(user):
         st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
 
     with st.form(key=f"save_form_{st.session_state.form_version}", clear_on_submit=False):
-        st.selectbox(
-            "評価",
-            ["〇", "△", "×"],
-            key=entry_key("rating"),
-        )
-
-        st.text_area(
-            "種目メモ",
-            key=entry_key("workout_note"),
-            placeholder="任意",
-        )
-
+        st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
+        st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
         button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
         submitted = st.form_submit_button(button_label, type="primary")
 
@@ -1250,16 +1018,13 @@ def render_input_page(user):
         rest_seconds = st.session_state[entry_key("rest_seconds")]
         rating = st.session_state[entry_key("rating")]
         workout_note = st.session_state[entry_key("workout_note")]
-        sets_data = get_current_sets()
+        sets_data = df_to_sets(st.session_state[editor_data_key()])
 
         if category == CATEGORY_PLACEHOLDER:
             st.error("カテゴリを選択してください。")
             return
         if exercise == EXERCISE_PLACEHOLDER:
             st.error("種目を選択してください。")
-            return
-        if any(not s["_valid"] for s in sets_data):
-            st.error("重さ・回数には数値を入力してください。")
             return
 
         valid_sets = []
@@ -1271,17 +1036,6 @@ def render_input_page(user):
             st.error("最低1セットは入力してください。")
             return
 
-        payload_sets = []
-        for s in valid_sets:
-            payload_sets.append(
-                {
-                    "weight": s["weight"],
-                    "reps_unassisted": s["reps_unassisted"],
-                    "reps_assisted": s["reps_assisted"],
-                    "is_warmup": s["is_warmup"],
-                }
-            )
-
         if st.session_state.editing_workout_id is None:
             save_workout(
                 user["id"],
@@ -1291,7 +1045,7 @@ def render_input_page(user):
                 rest_seconds,
                 rating,
                 workout_note,
-                payload_sets,
+                valid_sets,
             )
             st.session_state.flash_message = "記録を保存しました。"
             reset_entry_form(
@@ -1308,7 +1062,7 @@ def render_input_page(user):
                 rest_seconds,
                 rating,
                 workout_note,
-                payload_sets,
+                valid_sets,
             )
             st.session_state.flash_message = "記録を更新しました。"
             reset_entry_form()

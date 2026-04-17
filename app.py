@@ -85,7 +85,6 @@ EXERCISE_MASTER = {
     ],
 }
 
-# 参考kcal用の簡易MET設定
 EXERCISE_METS = {
     "ベンチプレス": 6.0,
     "ダンベルフライ": 5.0,
@@ -1337,39 +1336,20 @@ ensure_form_defaults()
 
 if st.session_state.current_user is None:
     st.title("🏋️ 筋トレメモ")
-    st.write("IDとPWでログインして使います。新規登録もこの画面からできます。")
+    st.write("IDとPWでログインして使います。")
 
-    login_tab, signup_tab = st.tabs(["ログイン", "新規登録"])
+    login_id = st.text_input("ID", key="login_id")
+    login_pw = st.text_input("PW", type="password", key="login_pw")
 
-    with login_tab:
-        login_id = st.text_input("ID", key="login_id")
-        login_pw = st.text_input("PW", type="password", key="login_pw")
-
-        if st.button("ログイン", key="login_button", type="primary"):
-            user = authenticate(login_id, login_pw)
-            if user:
-                st.session_state.current_user = user
-                reset_entry_form()
-                st.success("ログインしました。")
-                st.rerun()
-            else:
-                st.error("IDまたはPWが違います。")
-
-    with signup_tab:
-        signup_name = st.text_input(
-            "表示名",
-            key="signup_name",
-            placeholder="任意。空ならIDを表示名にします",
-        )
-        signup_id = st.text_input("新しいID", key="signup_id")
-        signup_pw = st.text_input("新しいPW", type="password", key="signup_pw")
-
-        if st.button("新規登録する", key="signup_button"):
-            ok, message = create_user(signup_id, signup_pw, signup_name)
-            if ok:
-                st.success(message)
-            else:
-                st.error(message)
+    if st.button("ログイン", key="login_button", type="primary"):
+        user = authenticate(login_id, login_pw)
+        if user:
+            st.session_state.current_user = user
+            reset_entry_form()
+            st.success("ログインしました。")
+            st.rerun()
+        else:
+            st.error("IDまたはPWが違います。")
 
     st.stop()
 

@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2

@@ -1078,6 +1078,110 @@ def render_input_page(user):
             st.session_state.editing_workout_id,
         )
 
+    current_sets = get_current_sets()
+
+    # 修正モードはフォーム一括送信で確実に更新
+    if st.session_state.editing_workout_id is not None:
+        with st.form(key=f"edit_form_{st.session_state.form_version}", clear_on_submit=False):
+            st.subheader("セット入力")
+
+            for i in range(st.session_state.set_count):
+                with st.expander(f"Set {i + 1}", expanded=True):
+                    st.checkbox(
+                        "ウォームアップ",
+                        key=set_key("is_warmup", i),
+                    )
+                    st.number_input(
+                        "重さ (kg)",
+                        min_value=0.0,
+                        step=2.5,
+                        key=set_key("weight", i),
+                    )
+                    st.number_input(
+                        "回数（補助なし）",
+                        min_value=0,
+                        step=1,
+                        key=set_key("reps_unassisted", i),
+                    )
+                    st.number_input(
+                        "回数（補助あり）",
+                        min_value=0,
+                        step=1,
+                        key=set_key("reps_assisted", i),
+                    )
+
+            current_sets = get_current_sets()
+            best_1rm, best_set = best_estimated_1rm(current_sets)
+
+            if best_1rm is not None and best_set is not None:
+                st.info(
+                    f'参考: 推定1RM {best_1rm:.1f} kg '
+                    f'（{best_set["weight"]} kg × 補助なし {best_set["reps_unassisted"]} 回 / ウォームアップ除外）'
+                )
+            else:
+                st.caption("参考値は、補助なし1〜10回・ウォームアップ以外のセットがあると表示します。")
+
+            body_weight_kg = get_user_body_weight_kg(user)
+            if body_weight_kg is None:
+                st.caption("参考kcalは、プロフィールで体重を設定すると記録一覧に表示されます。")
+            else:
+                st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
+
+            st.selectbox(
+                "評価",
+                ["〇", "△", "×"],
+                key=entry_key("rating"),
+            )
+
+            st.text_area(
+                "種目メモ",
+                key=entry_key("workout_note"),
+                placeholder="任意",
+            )
+
+            submitted = st.form_submit_button("更新する", type="primary")
+
+        if submitted:
+            workout_date = st.session_state[entry_key("workout_date")]
+            category = st.session_state[entry_key("category")]
+            exercise = st.session_state[entry_key("exercise")]
+            rest_seconds = st.session_state[entry_key("rest_seconds")]
+            rating = st.session_state[entry_key("rating")]
+            workout_note = st.session_state[entry_key("workout_note")]
+            sets_data = get_current_sets()
+
+            valid_sets = []
+            for s in sets_data:
+                if s["weight"] > 0 or s["reps_unassisted"] > 0 or s["reps_assisted"] > 0:
+                    valid_sets.append(s)
+
+            if category == CATEGORY_PLACEHOLDER:
+                st.error("カテゴリを選択してください。")
+            elif exercise == EXERCISE_PLACEHOLDER:
+                st.error("種目を選択してください。")
+            elif not valid_sets:
+                st.error("最低1セットは入力してください。")
+            else:
+                update_workout(
+                    st.session_state.editing_workout_id,
+                    workout_date,
+                    category,
+                    exercise,
+                    rest_seconds,
+                    rating,
+                    workout_note,
+                    valid_sets,
+                )
+                st.success("更新しました。")
+                reset_entry_form(
+                    preserve_date=workout_date,
+                    preserve_rest=rest_seconds,
+                )
+                st.rerun()
+
+        return
+
+    # 新規入力モード
     st.subheader("セット入力")
 
     for i in range(st.session_state.set_count):
@@ -1146,8 +1250,6 @@ def render_input_page(user):
     else:
         st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
 
-    button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
-
     with st.form(key=f"save_form_{st.session_state.form_version}", clear_on_submit=False):
         st.selectbox(
             "評価",
@@ -1161,7 +1263,7 @@ def render_input_page(user):
             placeholder="任意",
         )
 
-        submitted = st.form_submit_button(button_label, type="primary")
+        submitted = st.form_submit_button("この内容で保存", type="primary")
 
     if submitted:
         workout_date = st.session_state[entry_key("workout_date")]
@@ -1184,31 +1286,17 @@ def render_input_page(user):
         elif not valid_sets:
             st.error("最低1セットは入力してください。")
         else:
-            if st.session_state.editing_workout_id is None:
-                save_workout(
-                    user["id"],
-                    workout_date,
-                    category,
-                    exercise,
-                    rest_seconds,
-                    rating,
-                    workout_note,
-                    valid_sets,
-                )
-                st.success("保存しました。")
-            else:
-                update_workout(
-                    st.session_state.editing_workout_id,
-                    workout_date,
-                    category,
-                    exercise,
-                    rest_seconds,
-                    rating,
-                    workout_note,
-                    valid_sets,
-                )
-                st.success("更新しました。")
-
+            save_workout(
+                user["id"],
+                workout_date,
+                category,
+                exercise,
+                rest_seconds,
+                rating,
+                workout_note,
+                valid_sets,
+            )
+            st.success("保存しました。")
             reset_entry_form(
                 preserve_date=workout_date,
                 preserve_rest=rest_seconds,

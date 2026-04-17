@@ -1,11 +1,14 @@
 import os
 import sqlite3
 import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import streamlit as st
+import extra_streamlit_components as stx
 
 DB_NAME = "workout_app.db"
+SESSION_COOKIE_NAME = "workout_session_token"
+SESSION_HOURS = 2
 
 CATEGORY_PLACEHOLDER = "選択してください"
 EXERCISE_PLACEHOLDER = "選択してください"
@@ -177,6 +180,10 @@ def column_exists(table_name, column_name):
     return column_name in get_table_columns(table_name)
 
 
+def utcnow():
+    return datetime.utcnow()
+
+
 def infer_category_from_exercise(exercise):
     exercise = (exercise or "").strip()
     for category, exercises in EXERCISE_MASTER.items():
@@ -238,6 +245,18 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+        """
+    )
+
     conn.commit()
 
     if not column_exists("users", "height_cm"):
@@ -263,6 +282,87 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def cleanup_expired_sessions():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM sessions WHERE expires_at <= ?",
+        (utcnow().isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_session(user_id, hours=SESSION_HOURS):
+    token = os.urandom(32).hex()
+    expires_at = utcnow() + timedelta(hours=hours)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO sessions (token, user_id, expires_at, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            token,
+            user_id,
+            expires_at.isoformat(),
+            utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    return token, expires_at
+
+
+def delete_session(token):
+    if not token:
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def get_user_from_session(token):
+    if not token:
+        return None
+
+    cleanup_expired_sessions()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT s.user_id, s.expires_at
+        FROM sessions s
+        WHERE s.token = ?
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row is None:
+        return None
+
+    try:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+    except Exception:
+        delete_session(token)
+        return None
+
+    if expires_at <= utcnow():
+        delete_session(token)
+        return None
+
+    return get_user_by_id(row["user_id"])
 
 
 def hash_password(password, salt_hex=None):
@@ -304,7 +404,7 @@ def create_user(username, password, display_name):
                 None,
                 salt_hex,
                 pwd_hash_hex,
-                datetime.now().isoformat(),
+                utcnow().isoformat(),
             ),
         )
         conn.commit()
@@ -393,7 +493,7 @@ def save_workout(user_id, workout_date, category, exercise, rest_seconds, rating
             int(rest_seconds),
             rating,
             (workout_note or "").strip(),
-            datetime.now().isoformat(),
+            utcnow().isoformat(),
         ),
     )
     workout_id = cur.lastrowid
@@ -1330,13 +1430,26 @@ div[data-testid="stExpander"] {
     unsafe_allow_html=True,
 )
 
+cookie_manager = stx.CookieManager()
+
 init_db()
+cleanup_expired_sessions()
 ensure_app_state()
 ensure_form_defaults()
 
+cookies = cookie_manager.get_all()
+existing_token = cookies.get(SESSION_COOKIE_NAME)
+
+if st.session_state.current_user is None and existing_token:
+    remembered_user = get_user_from_session(existing_token)
+    if remembered_user:
+        st.session_state.current_user = remembered_user
+    else:
+        cookie_manager.delete(SESSION_COOKIE_NAME)
+
 if st.session_state.current_user is None:
     st.title("🏋️ 筋トレメモ")
-    st.write("IDとPWでログインして使います。")
+    st.write(f"IDとPWでログインして使います。ログイン状態は {SESSION_HOURS} 時間保持します。")
 
     login_id = st.text_input("ID", key="login_id")
     login_pw = st.text_input("PW", type="password", key="login_pw")
@@ -1344,7 +1457,13 @@ if st.session_state.current_user is None:
     if st.button("ログイン", key="login_button", type="primary"):
         user = authenticate(login_id, login_pw)
         if user:
-            st.session_state.current_user = user
+            token, expires_at = create_session(user["id"], hours=SESSION_HOURS)
+            cookie_manager.set(
+                SESSION_COOKIE_NAME,
+                token,
+                expires_at=expires_at,
+            )
+            st.session_state.current_user = get_user_by_id(user["id"])
             reset_entry_form()
             st.success("ログインしました。")
             st.rerun()
@@ -1358,9 +1477,15 @@ user = st.session_state.current_user
 top_left, top_right = st.columns([4, 1])
 with top_left:
     st.title("🏋️ 筋トレメモ")
-    st.caption(f'ログイン中: {user["display_name"]} / ID: {user["username"]}')
+    st.caption(
+        f'ログイン中: {user["display_name"]} / ID: {user["username"]} / ログイン保持: {SESSION_HOURS}時間'
+    )
 with top_right:
     if st.button("ログアウト", key="logout_button"):
+        existing_token = cookie_manager.get_all().get(SESSION_COOKIE_NAME)
+        if existing_token:
+            delete_session(existing_token)
+            cookie_manager.delete(SESSION_COOKIE_NAME)
         st.session_state.current_user = None
         st.rerun()
 

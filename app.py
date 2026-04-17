@@ -1045,6 +1045,26 @@ def render_input_page(user):
 
     selected_category = st.session_state[entry_key("category")]
 
+    if selected_category == CATEGORY_PLACEHOLDER:def render_input_page(user):
+    if st.session_state.editing_workout_id is not None:
+        st.warning("現在、既存記録を修正中です。")
+        if st.button("修正をやめる", key="cancel_edit"):
+            reset_entry_form()
+            st.rerun()
+
+    st.subheader("入力")
+
+    st.date_input("日付", key=entry_key("workout_date"))
+
+    category_options = [CATEGORY_PLACEHOLDER] + list(EXERCISE_MASTER.keys())
+    st.selectbox(
+        "カテゴリ",
+        category_options,
+        key=entry_key("category"),
+    )
+
+    selected_category = st.session_state[entry_key("category")]
+
     if selected_category == CATEGORY_PLACEHOLDER:
         exercise_options = [EXERCISE_PLACEHOLDER]
         st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
@@ -1146,21 +1166,24 @@ def render_input_page(user):
     else:
         st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
 
-    st.selectbox(
-        "評価",
-        ["〇", "△", "×"],
-        key=entry_key("rating"),
-    )
-
-    st.text_area(
-        "種目メモ",
-        key=entry_key("workout_note"),
-        placeholder="任意",
-    )
-
     button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
 
-    if st.button(button_label, type="primary", key="save_workout_button"):
+    with st.form(key=f"save_form_{st.session_state.form_version}", clear_on_submit=False):
+        st.selectbox(
+            "評価",
+            ["〇", "△", "×"],
+            key=entry_key("rating"),
+        )
+
+        st.text_area(
+            "種目メモ",
+            key=entry_key("workout_note"),
+            placeholder="任意",
+        )
+
+        submitted = st.form_submit_button(button_label, type="primary")
+
+    if submitted:
         workout_date = st.session_state[entry_key("workout_date")]
         category = st.session_state[entry_key("category")]
         exercise = st.session_state[entry_key("exercise")]

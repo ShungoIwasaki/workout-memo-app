@@ -4,7 +4,7 @@ import hashlib
 from datetime import date, datetime, timedelta
 
 import streamlit as st
-import extra_streamlit_components as stx
+from streamlit_cookies_manager import EncryptedCookieManager
 
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
@@ -159,6 +159,18 @@ CATEGORY_DEFAULT_MET = {
     "腕": 4.8,
     "腹筋": 4.5,
 }
+
+
+def get_cookie_password():
+    try:
+        if "cookie_password" in st.secrets:
+            return st.secrets["cookie_password"]
+    except Exception:
+        pass
+    return "change-this-cookie-password-before-serious-use-2026"
+
+
+COOKIE_PASSWORD = get_cookie_password()
 
 
 def get_conn():
@@ -316,7 +328,7 @@ def create_session(user_id, hours=SESSION_HOURS):
     conn.commit()
     conn.close()
 
-    return token, expires_at
+    return token
 
 
 def delete_session(token):
@@ -374,46 +386,6 @@ def hash_password(password, salt_hex=None):
         200_000,
     )
     return salt.hex(), pwd_hash.hex()
-
-
-def create_user(username, password, display_name):
-    username = (username or "").strip()
-    password = password or ""
-    display_name = (display_name or "").strip() or username
-
-    if not username or not password:
-        return False, "IDとPWは必須です。"
-
-    salt_hex, pwd_hash_hex = hash_password(password)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (
-                username, display_name, height_cm, body_weight_kg, password_salt, password_hash, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                username,
-                display_name,
-                None,
-                None,
-                salt_hex,
-                pwd_hash_hex,
-                utcnow().isoformat(),
-            ),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False, "そのIDは既に使われています。"
-
-    conn.close()
-    return True, "登録しました。ログインしてください。"
 
 
 def authenticate(username, password):
@@ -1430,14 +1402,19 @@ div[data-testid="stExpander"] {
     unsafe_allow_html=True,
 )
 
-cookie_manager = stx.CookieManager()
+cookies = EncryptedCookieManager(
+    prefix="workout-memo/",
+    password=COOKIE_PASSWORD,
+)
+
+if not cookies.ready():
+    st.stop()
 
 init_db()
 cleanup_expired_sessions()
 ensure_app_state()
 ensure_form_defaults()
 
-cookies = cookie_manager.get_all()
 existing_token = cookies.get(SESSION_COOKIE_NAME)
 
 if st.session_state.current_user is None and existing_token:
@@ -1445,7 +1422,11 @@ if st.session_state.current_user is None and existing_token:
     if remembered_user:
         st.session_state.current_user = remembered_user
     else:
-        cookie_manager.delete(SESSION_COOKIE_NAME)
+        try:
+            del cookies[SESSION_COOKIE_NAME]
+            cookies.save()
+        except Exception:
+            pass
 
 if st.session_state.current_user is None:
     st.title("🏋️ 筋トレメモ")
@@ -1457,12 +1438,9 @@ if st.session_state.current_user is None:
     if st.button("ログイン", key="login_button", type="primary"):
         user = authenticate(login_id, login_pw)
         if user:
-            token, expires_at = create_session(user["id"], hours=SESSION_HOURS)
-            cookie_manager.set(
-                SESSION_COOKIE_NAME,
-                token,
-                expires_at=expires_at,
-            )
+            token = create_session(user["id"], hours=SESSION_HOURS)
+            cookies[SESSION_COOKIE_NAME] = token
+            cookies.save()
             st.session_state.current_user = get_user_by_id(user["id"])
             reset_entry_form()
             st.success("ログインしました。")
@@ -1482,10 +1460,14 @@ with top_left:
     )
 with top_right:
     if st.button("ログアウト", key="logout_button"):
-        existing_token = cookie_manager.get_all().get(SESSION_COOKIE_NAME)
+        existing_token = cookies.get(SESSION_COOKIE_NAME)
         if existing_token:
             delete_session(existing_token)
-            cookie_manager.delete(SESSION_COOKIE_NAME)
+            try:
+                del cookies[SESSION_COOKIE_NAME]
+                cookies.save()
+            except Exception:
+                pass
         st.session_state.current_user = None
         st.rerun()
 

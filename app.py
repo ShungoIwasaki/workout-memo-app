@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -215,6 +215,36 @@ def infer_category_from_exercise(exercise):
         if exercise in exercises:
             return category
     return list(EXERCISE_MASTER.keys())[0]
+
+
+def format_number_for_input(value):
+    try:
+        f = float(value)
+        if f.is_integer():
+            return str(int(f))
+        return str(f)
+    except Exception:
+        return "0"
+
+
+def parse_float_input(value):
+    s = str(value).strip()
+    if s == "":
+        return 0.0, False
+    try:
+        return float(s), True
+    except Exception:
+        return 0.0, False
+
+
+def parse_int_input(value):
+    s = str(value).strip()
+    if s == "":
+        return 0, False
+    try:
+        return int(float(s)), True
+    except Exception:
+        return 0, False
 
 
 def init_db():
@@ -708,9 +738,9 @@ def best_estimated_1rm(sets_data):
 
 def default_set():
     return {
-        "weight": 0.0,
-        "reps_unassisted": 0,
-        "reps_assisted": 0,
+        "weight": "0",
+        "reps_unassisted": "0",
+        "reps_assisted": "0",
         "is_warmup": False,
     }
 
@@ -782,11 +812,23 @@ def ensure_form_defaults():
 
 
 def read_set_from_state(index):
+    raw_weight = st.session_state.get(set_key("weight", index), "0")
+    raw_reps_unassisted = st.session_state.get(set_key("reps_unassisted", index), "0")
+    raw_reps_assisted = st.session_state.get(set_key("reps_assisted", index), "0")
+
+    weight, ok_weight = parse_float_input(raw_weight)
+    reps_unassisted, ok_reps_unassisted = parse_int_input(raw_reps_unassisted)
+    reps_assisted, ok_reps_assisted = parse_int_input(raw_reps_assisted)
+
     return {
-        "weight": float(st.session_state.get(set_key("weight", index), 0.0)),
-        "reps_unassisted": int(st.session_state.get(set_key("reps_unassisted", index), 0)),
-        "reps_assisted": int(st.session_state.get(set_key("reps_assisted", index), 0)),
+        "weight": weight,
+        "reps_unassisted": reps_unassisted,
+        "reps_assisted": reps_assisted,
         "is_warmup": bool(st.session_state.get(set_key("is_warmup", index), False)),
+        "_raw_weight": raw_weight,
+        "_raw_reps_unassisted": raw_reps_unassisted,
+        "_raw_reps_assisted": raw_reps_assisted,
+        "_valid": ok_weight and ok_reps_unassisted and ok_reps_assisted,
     }
 
 
@@ -834,9 +876,9 @@ def load_form_data(header, sets_data, editing_id=None):
         normalized_sets.append(default_set())
 
     for i, s in enumerate(normalized_sets):
-        st.session_state[set_key("weight", i)] = float(s["weight"])
-        st.session_state[set_key("reps_unassisted", i)] = int(s["reps_unassisted"])
-        st.session_state[set_key("reps_assisted", i)] = int(s["reps_assisted"])
+        st.session_state[set_key("weight", i)] = format_number_for_input(s["weight"])
+        st.session_state[set_key("reps_unassisted", i)] = format_number_for_input(s["reps_unassisted"])
+        st.session_state[set_key("reps_assisted", i)] = format_number_for_input(s["reps_assisted"])
         st.session_state[set_key("is_warmup", i)] = bool(s["is_warmup"])
 
 
@@ -847,8 +889,15 @@ def add_new_set(copy_from_index=None):
     if copy_from_index is None:
         sets_data.append(default_set())
     else:
-        copied = dict(sets_data[copy_from_index])
-        sets_data.append(copied)
+        copied = sets_data[copy_from_index]
+        sets_data.append(
+            {
+                "weight": copied["_raw_weight"],
+                "reps_unassisted": copied["_raw_reps_unassisted"],
+                "reps_assisted": copied["_raw_reps_assisted"],
+                "is_warmup": copied["is_warmup"],
+            }
+        )
 
     load_form_data(header, sets_data, st.session_state.editing_workout_id)
 
@@ -859,7 +908,18 @@ def remove_set(index):
         return
 
     header = collect_header_from_state()
-    new_sets = [s for i, s in enumerate(sets_data) if i != index]
+    new_sets = []
+    for i, s in enumerate(sets_data):
+        if i != index:
+            new_sets.append(
+                {
+                    "weight": s["_raw_weight"],
+                    "reps_unassisted": s["_raw_reps_unassisted"],
+                    "reps_assisted": s["_raw_reps_assisted"],
+                    "is_warmup": s["is_warmup"],
+                }
+            )
+
     load_form_data(header, new_sets, st.session_state.editing_workout_id)
 
 
@@ -874,6 +934,11 @@ def reset_entry_form(preserve_date=None, preserve_rest=None):
     st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
     st.session_state[entry_key("rating")] = "△"
     st.session_state[entry_key("workout_note")] = ""
+
+    st.session_state[set_key("weight", 0)] = "0"
+    st.session_state[set_key("reps_unassisted", 0)] = "0"
+    st.session_state[set_key("reps_assisted", 0)] = "0"
+    st.session_state[set_key("is_warmup", 0)] = False
 
 
 def load_workout_into_form(workout_id):
@@ -895,9 +960,9 @@ def load_workout_into_form(workout_id):
     for row in sets_rows:
         sets_data.append(
             {
-                "weight": float(row["weight"]),
-                "reps_unassisted": int(row["reps_unassisted"]),
-                "reps_assisted": int(row["reps_assisted"]),
+                "weight": format_number_for_input(row["weight"]),
+                "reps_unassisted": format_number_for_input(row["reps_unassisted"]),
+                "reps_assisted": format_number_for_input(row["reps_assisted"]),
                 "is_warmup": bool(row["is_warmup"]),
             }
         )
@@ -1040,6 +1105,53 @@ def render_previous_exercise_summary(user_id, exercise, exclude_workout_id=None)
     )
 
 
+def render_set_block(i):
+    with st.expander(f"Set {i + 1}", expanded=True):
+        st.checkbox(
+            "ウォームアップ",
+            key=set_key("is_warmup", i),
+        )
+        st.text_input(
+            "重さ (kg)",
+            key=set_key("weight", i),
+            placeholder="例: 20 / 20.5",
+        )
+        st.text_input(
+            "回数（補助なし）",
+            key=set_key("reps_unassisted", i),
+            placeholder="例: 8",
+        )
+        st.text_input(
+            "回数（補助あり）",
+            key=set_key("reps_assisted", i),
+            placeholder="例: 2",
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(
+                "コピー追加",
+                key=f"copy_{st.session_state.form_version}_{i}",
+            ):
+                add_new_set(copy_from_index=i)
+                st.rerun()
+        with c2:
+            if st.button(
+                "空で追加",
+                key=f"blank_{st.session_state.form_version}_{i}",
+            ):
+                add_new_set(copy_from_index=None)
+                st.rerun()
+        with c3:
+            if st.button(
+                "このセット削除",
+                key=f"remove_{st.session_state.form_version}_{i}",
+                disabled=(st.session_state.set_count <= 1),
+            ):
+                remove_set(i)
+                st.rerun()
+
+
 def render_input_page(user):
     if st.session_state.editing_workout_id is not None:
         st.warning("現在、既存記録を修正中です。")
@@ -1093,156 +1205,10 @@ def render_input_page(user):
             st.session_state.editing_workout_id,
         )
 
-    current_sets = get_current_sets()
-
-    if st.session_state.editing_workout_id is not None:
-        with st.form(key=f"edit_form_{st.session_state.form_version}", clear_on_submit=False):
-            st.subheader("セット入力")
-
-            for i in range(st.session_state.set_count):
-                with st.expander(f"Set {i + 1}", expanded=True):
-                    st.checkbox(
-                        "ウォームアップ",
-                        key=set_key("is_warmup", i),
-                    )
-                    st.number_input(
-                        "重さ (kg)",
-                        min_value=0.0,
-                        step=2.5,
-                        key=set_key("weight", i),
-                    )
-                    st.number_input(
-                        "回数（補助なし）",
-                        min_value=0,
-                        step=1,
-                        key=set_key("reps_unassisted", i),
-                    )
-                    st.number_input(
-                        "回数（補助あり）",
-                        min_value=0,
-                        step=1,
-                        key=set_key("reps_assisted", i),
-                    )
-
-            current_sets = get_current_sets()
-            best_1rm, best_set = best_estimated_1rm(current_sets)
-
-            if best_1rm is not None and best_set is not None:
-                st.info(
-                    f'参考: 推定1RM {best_1rm:.1f} kg '
-                    f'（{best_set["weight"]} kg × 補助なし {best_set["reps_unassisted"]} 回 / ウォームアップ除外）'
-                )
-            else:
-                st.caption("参考値は、補助なし1〜10回・ウォームアップ以外のセットがあると表示します。")
-
-            body_weight_kg = get_user_body_weight_kg(user)
-            if body_weight_kg is None:
-                st.caption("参考kcalは、プロフィールで体重を設定すると記録一覧に表示されます。")
-            else:
-                st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
-
-            st.selectbox(
-                "評価",
-                ["〇", "△", "×"],
-                key=entry_key("rating"),
-            )
-
-            st.text_area(
-                "種目メモ",
-                key=entry_key("workout_note"),
-                placeholder="任意",
-            )
-
-            submitted = st.form_submit_button("更新する", type="primary")
-
-        if submitted:
-            workout_date = st.session_state[entry_key("workout_date")]
-            category = st.session_state[entry_key("category")]
-            exercise = st.session_state[entry_key("exercise")]
-            rest_seconds = st.session_state[entry_key("rest_seconds")]
-            rating = st.session_state[entry_key("rating")]
-            workout_note = st.session_state[entry_key("workout_note")]
-            sets_data = get_current_sets()
-
-            valid_sets = []
-            for s in sets_data:
-                if s["weight"] > 0 or s["reps_unassisted"] > 0 or s["reps_assisted"] > 0:
-                    valid_sets.append(s)
-
-            if category == CATEGORY_PLACEHOLDER:
-                st.error("カテゴリを選択してください。")
-            elif exercise == EXERCISE_PLACEHOLDER:
-                st.error("種目を選択してください。")
-            elif not valid_sets:
-                st.error("最低1セットは入力してください。")
-            else:
-                update_workout(
-                    st.session_state.editing_workout_id,
-                    workout_date,
-                    category,
-                    exercise,
-                    rest_seconds,
-                    rating,
-                    workout_note,
-                    valid_sets,
-                )
-                st.session_state.flash_message = "記録を更新しました。"
-                reset_entry_form()
-                st.session_state.page = "記録一覧"
-                st.rerun()
-
-        return
-
     st.subheader("セット入力")
 
     for i in range(st.session_state.set_count):
-        with st.expander(f"Set {i + 1}", expanded=True):
-            st.checkbox(
-                "ウォームアップ",
-                key=set_key("is_warmup", i),
-            )
-            st.number_input(
-                "重さ (kg)",
-                min_value=0.0,
-                step=2.5,
-                key=set_key("weight", i),
-            )
-            st.number_input(
-                "回数（補助なし）",
-                min_value=0,
-                step=1,
-                key=set_key("reps_unassisted", i),
-            )
-            st.number_input(
-                "回数（補助あり）",
-                min_value=0,
-                step=1,
-                key=set_key("reps_assisted", i),
-            )
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button(
-                    "コピー追加",
-                    key=f"copy_{st.session_state.form_version}_{i}",
-                ):
-                    add_new_set(copy_from_index=i)
-                    st.rerun()
-            with c2:
-                if st.button(
-                    "空で追加",
-                    key=f"blank_{st.session_state.form_version}_{i}",
-                ):
-                    add_new_set(copy_from_index=None)
-                    st.rerun()
-            with c3:
-                if st.button(
-                    "このセット削除",
-                    key=f"remove_{st.session_state.form_version}_{i}",
-                    disabled=(st.session_state.set_count <= 1),
-                ):
-                    remove_set(i)
-                    st.rerun()
+        render_set_block(i)
 
     current_sets = get_current_sets()
     best_1rm, best_set = best_estimated_1rm(current_sets)
@@ -1274,7 +1240,8 @@ def render_input_page(user):
             placeholder="任意",
         )
 
-        submitted = st.form_submit_button("この内容で保存", type="primary")
+        button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
+        submitted = st.form_submit_button(button_label, type="primary")
 
     if submitted:
         workout_date = st.session_state[entry_key("workout_date")]
@@ -1285,18 +1252,37 @@ def render_input_page(user):
         workout_note = st.session_state[entry_key("workout_note")]
         sets_data = get_current_sets()
 
+        if category == CATEGORY_PLACEHOLDER:
+            st.error("カテゴリを選択してください。")
+            return
+        if exercise == EXERCISE_PLACEHOLDER:
+            st.error("種目を選択してください。")
+            return
+        if any(not s["_valid"] for s in sets_data):
+            st.error("重さ・回数には数値を入力してください。")
+            return
+
         valid_sets = []
         for s in sets_data:
             if s["weight"] > 0 or s["reps_unassisted"] > 0 or s["reps_assisted"] > 0:
                 valid_sets.append(s)
 
-        if category == CATEGORY_PLACEHOLDER:
-            st.error("カテゴリを選択してください。")
-        elif exercise == EXERCISE_PLACEHOLDER:
-            st.error("種目を選択してください。")
-        elif not valid_sets:
+        if not valid_sets:
             st.error("最低1セットは入力してください。")
-        else:
+            return
+
+        payload_sets = []
+        for s in valid_sets:
+            payload_sets.append(
+                {
+                    "weight": s["weight"],
+                    "reps_unassisted": s["reps_unassisted"],
+                    "reps_assisted": s["reps_assisted"],
+                    "is_warmup": s["is_warmup"],
+                }
+            )
+
+        if st.session_state.editing_workout_id is None:
             save_workout(
                 user["id"],
                 workout_date,
@@ -1305,13 +1291,28 @@ def render_input_page(user):
                 rest_seconds,
                 rating,
                 workout_note,
-                valid_sets,
+                payload_sets,
             )
             st.session_state.flash_message = "記録を保存しました。"
             reset_entry_form(
                 preserve_date=workout_date,
                 preserve_rest=rest_seconds,
             )
+            st.rerun()
+        else:
+            update_workout(
+                st.session_state.editing_workout_id,
+                workout_date,
+                category,
+                exercise,
+                rest_seconds,
+                rating,
+                workout_note,
+                payload_sets,
+            )
+            st.session_state.flash_message = "記録を更新しました。"
+            reset_entry_form()
+            st.session_state.page = "記録一覧"
             st.rerun()
 
 

@@ -3,11 +3,10 @@ import sqlite3
 import hashlib
 from datetime import date, datetime, timedelta
 
-import pandas as pd
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -312,6 +311,7 @@ def create_session(user_id, hours=SESSION_HOURS):
 def delete_session(token):
     if not token:
         return
+
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
@@ -676,7 +676,6 @@ def calculate_workout_metrics(workout, sets_rows, body_weight_kg):
     main_load = 0.0
     total_sets = len(sets_rows)
     total_reps = 0
-    main_sets = 0
     active_seconds = 0
 
     for row in sets_rows:
@@ -687,7 +686,6 @@ def calculate_workout_metrics(workout, sets_rows, body_weight_kg):
         active_seconds += reps * 4
         if not bool(row["is_warmup"]):
             main_load += load
-            main_sets += 1
 
     rest_intervals = max(total_sets - 1, 0)
     total_seconds = active_seconds + int(workout["rest_seconds"]) * rest_intervals
@@ -735,48 +733,13 @@ def calculate_daily_summary(entries):
     return summary
 
 
-def default_sets_df():
-    return pd.DataFrame(
-        [
-            {
-                "is_warmup": False,
-                "weight": 0.0,
-                "reps_unassisted": 0,
-                "reps_assisted": 0,
-            }
-        ]
-    )
-
-
-def normalize_sets_df(df):
-    if df is None or len(df) == 0:
-        return default_sets_df()
-
-    df = df.copy()
-
-    for col in ["is_warmup", "weight", "reps_unassisted", "reps_assisted"]:
-        if col not in df.columns:
-            if col == "is_warmup":
-                df[col] = False
-            else:
-                df[col] = 0
-
-    df = df[["is_warmup", "weight", "reps_unassisted", "reps_assisted"]]
-
-    df["is_warmup"] = df["is_warmup"].fillna(False).astype(bool)
-    df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0)
-    df["reps_unassisted"] = pd.to_numeric(df["reps_unassisted"], errors="coerce").fillna(0).astype(int)
-    df["reps_assisted"] = pd.to_numeric(df["reps_assisted"], errors="coerce").fillna(0).astype(int)
-
-    if len(df) == 0:
-        return default_sets_df()
-
-    return df.reset_index(drop=True)
-
-
-def df_to_sets(df):
-    df = normalize_sets_df(df)
-    return df.to_dict("records")
+def default_set_model():
+    return {
+        "is_warmup": False,
+        "weight": 0.0,
+        "reps_unassisted": 0,
+        "reps_assisted": 0,
+    }
 
 
 def ensure_app_state():
@@ -796,56 +759,49 @@ def entry_key(name):
     return f"{name}_{st.session_state.form_version}"
 
 
-def editor_data_key():
-    return f"sets_data_{st.session_state.form_version}"
+def model_key():
+    return f"sets_model_{st.session_state.form_version}"
 
 
-def editor_widget_key():
-    return f"sets_editor_{st.session_state.form_version}"
+def set_widget_key(field, index):
+    return f"set_{field}_{st.session_state.form_version}_{index}"
 
 
-def reset_entry_form(preserve_date=None, preserve_rest=None):
-    st.session_state.form_version += 1
-    st.session_state.editing_workout_id = None
-
-    st.session_state[entry_key("workout_date")] = preserve_date if preserve_date is not None else date.today()
-    st.session_state[entry_key("category")] = CATEGORY_PLACEHOLDER
-    st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
-    st.session_state[entry_key("rest_seconds")] = int(preserve_rest) if preserve_rest is not None else 90
-    st.session_state[entry_key("rating")] = "△"
-    st.session_state[entry_key("workout_note")] = ""
-    st.session_state[editor_data_key()] = default_sets_df()
+def get_current_header():
+    return {
+        "workout_date": st.session_state.get(entry_key("workout_date"), date.today()),
+        "category": st.session_state.get(entry_key("category"), CATEGORY_PLACEHOLDER),
+        "exercise": st.session_state.get(entry_key("exercise"), EXERCISE_PLACEHOLDER),
+        "rest_seconds": st.session_state.get(entry_key("rest_seconds"), 90),
+        "rating": st.session_state.get(entry_key("rating"), "△"),
+        "workout_note": st.session_state.get(entry_key("workout_note"), ""),
+    }
 
 
-def load_workout_into_form(workout_id):
-    workout = get_workout_by_id(workout_id)
-    sets_rows = get_sets_for_workout(workout_id)
+def hydrate_set_widgets_from_model():
+    model = st.session_state[model_key()]
+    for i, row in enumerate(model):
+        wk = set_widget_key("is_warmup", i)
+        wtk = set_widget_key("weight", i)
+        ruk = set_widget_key("reps_unassisted", i)
+        rak = set_widget_key("reps_assisted", i)
 
-    st.session_state.form_version += 1
-    st.session_state.editing_workout_id = workout_id
+        if wk not in st.session_state:
+            st.session_state[wk] = bool(row["is_warmup"])
+        if wtk not in st.session_state:
+            st.session_state[wtk] = float(row["weight"])
+        if ruk not in st.session_state:
+            st.session_state[ruk] = int(row["reps_unassisted"])
+        if rak not in st.session_state:
+            st.session_state[rak] = int(row["reps_assisted"])
 
-    category = workout["category"] or infer_category_from_exercise(workout["exercise"])
 
-    st.session_state[entry_key("workout_date")] = datetime.strptime(workout["workout_date"], "%Y-%m-%d").date()
-    st.session_state[entry_key("category")] = category
-    st.session_state[entry_key("exercise")] = workout["exercise"]
-    st.session_state[entry_key("rest_seconds")] = int(workout["rest_seconds"])
-    st.session_state[entry_key("rating")] = workout["rating"] if workout["rating"] in ["〇", "△", "×"] else "△"
-    st.session_state[entry_key("workout_note")] = workout["workout_note"] or ""
-
-    df = pd.DataFrame(
-        [
-            {
-                "is_warmup": bool(row["is_warmup"]),
-                "weight": float(row["weight"]),
-                "reps_unassisted": int(row["reps_unassisted"]),
-                "reps_assisted": int(row["reps_assisted"]),
-            }
-            for row in sets_rows
-        ]
-    )
-
-    st.session_state[editor_data_key()] = normalize_sets_df(df)
+def sync_set_field(index, field):
+    model = st.session_state[model_key()]
+    if index >= len(model):
+        return
+    widget_key = set_widget_key(field, index)
+    model[index][field] = st.session_state[widget_key]
 
 
 def ensure_form_defaults():
@@ -861,8 +817,105 @@ def ensure_form_defaults():
         st.session_state[entry_key("rating")] = "△"
     if entry_key("workout_note") not in st.session_state:
         st.session_state[entry_key("workout_note")] = ""
-    if editor_data_key() not in st.session_state:
-        st.session_state[editor_data_key()] = default_sets_df()
+
+    if model_key() not in st.session_state:
+        st.session_state[model_key()] = [default_set_model()]
+
+    hydrate_set_widgets_from_model()
+
+
+def load_form_state(header, sets_model, editing_id=None):
+    st.session_state.form_version += 1
+    st.session_state.editing_workout_id = editing_id
+
+    st.session_state[entry_key("workout_date")] = header["workout_date"]
+    st.session_state[entry_key("category")] = header["category"]
+    st.session_state[entry_key("exercise")] = header["exercise"]
+    st.session_state[entry_key("rest_seconds")] = header["rest_seconds"]
+    st.session_state[entry_key("rating")] = header["rating"]
+    st.session_state[entry_key("workout_note")] = header["workout_note"]
+
+    st.session_state[model_key()] = sets_model
+    hydrate_set_widgets_from_model()
+
+
+def reset_entry_form(preserve_date=None, preserve_rest=None):
+    header = {
+        "workout_date": preserve_date if preserve_date is not None else date.today(),
+        "category": CATEGORY_PLACEHOLDER,
+        "exercise": EXERCISE_PLACEHOLDER,
+        "rest_seconds": int(preserve_rest) if preserve_rest is not None else 90,
+        "rating": "△",
+        "workout_note": "",
+    }
+    load_form_state(header, [default_set_model()], editing_id=None)
+
+
+def current_sets_model():
+    return st.session_state[model_key()]
+
+
+def current_sets_payload():
+    return [dict(row) for row in current_sets_model()]
+
+
+def append_blank_set():
+    header = get_current_header()
+    new_sets = current_sets_payload()
+    new_sets.append(default_set_model())
+    load_form_state(header, new_sets, st.session_state.editing_workout_id)
+
+
+def append_copy_set(index):
+    header = get_current_header()
+    new_sets = current_sets_payload()
+    if 0 <= index < len(new_sets):
+        new_sets.append(dict(new_sets[index]))
+    else:
+        new_sets.append(default_set_model())
+    load_form_state(header, new_sets, st.session_state.editing_workout_id)
+
+
+def remove_set(index):
+    header = get_current_header()
+    new_sets = current_sets_payload()
+    if len(new_sets) <= 1:
+        return
+    new_sets = [row for i, row in enumerate(new_sets) if i != index]
+    load_form_state(header, new_sets, st.session_state.editing_workout_id)
+
+
+def load_workout_into_form(workout_id):
+    workout = get_workout_by_id(workout_id)
+    sets_rows = get_sets_for_workout(workout_id)
+
+    category = workout["category"] or infer_category_from_exercise(workout["exercise"])
+
+    header = {
+        "workout_date": datetime.strptime(workout["workout_date"], "%Y-%m-%d").date(),
+        "category": category,
+        "exercise": workout["exercise"],
+        "rest_seconds": int(workout["rest_seconds"]),
+        "rating": workout["rating"] if workout["rating"] in ["〇", "△", "×"] else "△",
+        "workout_note": workout["workout_note"] or "",
+    }
+
+    sets_model = []
+    for row in sets_rows:
+        sets_model.append(
+            {
+                "is_warmup": bool(row["is_warmup"]),
+                "weight": float(row["weight"]),
+                "reps_unassisted": int(row["reps_unassisted"]),
+                "reps_assisted": int(row["reps_assisted"]),
+            }
+        )
+
+    if not sets_model:
+        sets_model = [default_set_model()]
+
+    load_form_state(header, sets_model, editing_id=workout_id)
+    st.session_state.page = "入力"
 
 
 def get_user_body_weight_kg(user):
@@ -913,6 +966,67 @@ def render_previous_exercise_summary(user_id, exercise, exclude_workout_id=None)
     )
 
 
+def render_set_block(i):
+    row = current_sets_model()[i]
+
+    with st.expander(f"Set {i + 1}", expanded=True):
+        st.checkbox(
+            "ウォームアップ",
+            key=set_widget_key("is_warmup", i),
+            value=bool(row["is_warmup"]),
+            on_change=sync_set_field,
+            args=(i, "is_warmup"),
+        )
+
+        st.number_input(
+            "重さ (kg)",
+            min_value=0.0,
+            step=2.5,
+            key=set_widget_key("weight", i),
+            value=float(row["weight"]),
+            on_change=sync_set_field,
+            args=(i, "weight"),
+        )
+
+        st.number_input(
+            "回数（補助なし）",
+            min_value=0,
+            step=1,
+            key=set_widget_key("reps_unassisted", i),
+            value=int(row["reps_unassisted"]),
+            on_change=sync_set_field,
+            args=(i, "reps_unassisted"),
+        )
+
+        st.number_input(
+            "回数（補助あり）",
+            min_value=0,
+            step=1,
+            key=set_widget_key("reps_assisted", i),
+            value=int(row["reps_assisted"]),
+            on_change=sync_set_field,
+            args=(i, "reps_assisted"),
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("コピー追加", key=f"copy_{st.session_state.form_version}_{i}"):
+                append_copy_set(i)
+                st.rerun()
+        with c2:
+            if st.button("空で追加", key=f"blank_{st.session_state.form_version}_{i}"):
+                append_blank_set()
+                st.rerun()
+        with c3:
+            if st.button(
+                "このセット削除",
+                key=f"remove_{st.session_state.form_version}_{i}",
+                disabled=(len(current_sets_model()) <= 1),
+            ):
+                remove_set(i)
+                st.rerun()
+
+
 def render_input_page(user):
     if st.session_state.editing_workout_id is not None:
         st.warning("現在、既存記録を修正中です。")
@@ -954,41 +1068,10 @@ def render_input_page(user):
 
     st.subheader("セット入力")
 
-    current_df = normalize_sets_df(st.session_state[editor_data_key()])
+    for i in range(len(current_sets_model())):
+        render_set_block(i)
 
-    edited_df = st.data_editor(
-        current_df,
-        key=editor_widget_key(),
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_config={
-            "is_warmup": st.column_config.CheckboxColumn("ウォームアップ"),
-            "weight": st.column_config.NumberColumn("重さ (kg)", min_value=0.0, step=2.5, format="%.2f"),
-            "reps_unassisted": st.column_config.NumberColumn("回数（補助なし）", min_value=0, step=1),
-            "reps_assisted": st.column_config.NumberColumn("回数（補助あり）", min_value=0, step=1),
-        },
-    )
-
-    edited_df = normalize_sets_df(pd.DataFrame(edited_df))
-    st.session_state[editor_data_key()] = edited_df
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("最後のセットをコピー追加", key=f"copy_last_{st.session_state.form_version}"):
-            source_df = normalize_sets_df(st.session_state[editor_data_key()])
-            last_row = source_df.iloc[-1].to_dict()
-            source_df = pd.concat([source_df, pd.DataFrame([last_row])], ignore_index=True)
-            st.session_state[editor_data_key()] = normalize_sets_df(source_df)
-            st.rerun()
-    with c2:
-        if st.button("最後のセットを削除", key=f"remove_last_{st.session_state.form_version}", disabled=len(edited_df) <= 1):
-            source_df = normalize_sets_df(st.session_state[editor_data_key()])
-            source_df = source_df.iloc[:-1].reset_index(drop=True)
-            st.session_state[editor_data_key()] = normalize_sets_df(source_df)
-            st.rerun()
-
-    current_sets = df_to_sets(st.session_state[editor_data_key()])
+    current_sets = current_sets_payload()
     best_1rm, best_set = best_estimated_1rm(current_sets)
 
     if best_1rm is not None and best_set is not None:
@@ -1005,20 +1088,19 @@ def render_input_page(user):
     else:
         st.caption(f"参考kcal計算にはプロフィール体重 {body_weight_kg:.1f} kg を使用します。")
 
-    with st.form(key=f"save_form_{st.session_state.form_version}", clear_on_submit=False):
-        st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
-        st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
-        button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
-        submitted = st.form_submit_button(button_label, type="primary")
+    st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
+    st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
 
-    if submitted:
+    button_label = "更新する" if st.session_state.editing_workout_id is not None else "この内容で保存"
+
+    if st.button(button_label, type="primary", key=f"save_btn_{st.session_state.form_version}"):
         workout_date = st.session_state[entry_key("workout_date")]
         category = st.session_state[entry_key("category")]
         exercise = st.session_state[entry_key("exercise")]
         rest_seconds = st.session_state[entry_key("rest_seconds")]
         rating = st.session_state[entry_key("rating")]
         workout_note = st.session_state[entry_key("workout_note")]
-        sets_data = df_to_sets(st.session_state[editor_data_key()])
+        sets_data = current_sets_payload()
 
         if category == CATEGORY_PLACEHOLDER:
             st.error("カテゴリを選択してください。")
@@ -1182,7 +1264,6 @@ def render_records_page(user):
                 with c1:
                     if st.button("修正する", key=f"edit_{workout['id']}"):
                         load_workout_into_form(workout["id"])
-                        st.session_state.page = "入力"
                         st.rerun()
                 with c2:
                     if st.button("削除する", key=f"delete_{workout['id']}"):
@@ -1238,21 +1319,36 @@ st.markdown(
     padding-top: 1rem;
     padding-bottom: 4rem;
 }
+
+/* タイトルとver以外を少し大きく */
+.stApp,
+.stApp p,
+.stApp li,
+.stApp label,
+.stApp input,
+.stApp textarea,
+.stApp button,
+.stApp div[data-baseweb="select"],
+.stApp [data-testid="stMarkdownContainer"],
+.stApp [data-testid="stCaptionContainer"],
+.stApp [data-testid="stAlertContainer"] {
+    font-size: 17px !important;
+}
+
 .stButton > button {
     width: 100%;
     min-height: 44px;
     border-radius: 12px;
 }
+
 div[data-testid="stExpander"] {
     border-radius: 12px;
 }
+
 @media (max-width: 640px) {
     .block-container {
         padding-left: 0.8rem;
         padding-right: 0.8rem;
-    }
-    h1 {
-        font-size: 1.6rem;
     }
 }
 </style>

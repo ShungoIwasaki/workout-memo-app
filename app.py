@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
+APP_VERSION = "1.1.0"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -171,6 +172,18 @@ def get_cookie_password():
 
 
 COOKIE_PASSWORD = get_cookie_password()
+
+
+def render_app_title():
+    st.markdown(
+        f"""
+        <div style="display:flex; align-items:flex-end; gap:10px; margin-bottom:0.5rem;">
+            <h1 style="margin:0;">🏋️ 筋トレメモ</h1>
+            <span style="font-size:0.9rem; color:#9aa0a6; margin-bottom:0.35rem;">ver.{APP_VERSION}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def get_conn():
@@ -713,6 +726,8 @@ def ensure_app_state():
         st.session_state.editing_workout_id = None
     if "page" not in st.session_state:
         st.session_state.page = "入力"
+    if "flash_message" not in st.session_state:
+        st.session_state.flash_message = None
 
 
 def entry_key(name):
@@ -1080,7 +1095,6 @@ def render_input_page(user):
 
     current_sets = get_current_sets()
 
-    # 修正モードはフォーム一括送信で確実に更新
     if st.session_state.editing_workout_id is not None:
         with st.form(key=f"edit_form_{st.session_state.form_version}", clear_on_submit=False):
             st.subheader("セット入力")
@@ -1172,16 +1186,13 @@ def render_input_page(user):
                     workout_note,
                     valid_sets,
                 )
-                st.success("更新しました。")
-                reset_entry_form(
-                    preserve_date=workout_date,
-                    preserve_rest=rest_seconds,
-                )
+                st.session_state.flash_message = "記録を更新しました。"
+                reset_entry_form()
+                st.session_state.page = "記録一覧"
                 st.rerun()
 
         return
 
-    # 新規入力モード
     st.subheader("セット入力")
 
     for i in range(st.session_state.set_count):
@@ -1296,7 +1307,7 @@ def render_input_page(user):
                 workout_note,
                 valid_sets,
             )
-            st.success("保存しました。")
+            st.session_state.flash_message = "記録を保存しました。"
             reset_entry_form(
                 preserve_date=workout_date,
                 preserve_rest=rest_seconds,
@@ -1423,6 +1434,7 @@ def render_records_page(user):
                         if st.session_state.editing_workout_id == workout["id"]:
                             reset_entry_form()
                         delete_workout(workout["id"])
+                        st.session_state.flash_message = "記録を削除しました。"
                         st.rerun()
 
 
@@ -1448,7 +1460,7 @@ def render_profile_page(user):
             )
             if ok:
                 st.session_state.current_user = get_user_by_id(user["id"])
-                st.success(message)
+                st.session_state.flash_message = message
                 st.rerun()
             else:
                 st.error(message)
@@ -1458,7 +1470,7 @@ def render_profile_page(user):
 
 
 st.set_page_config(
-    page_title="筋トレメモ",
+    page_title=f"筋トレメモ ver.{APP_VERSION}",
     page_icon="🏋️",
     layout="centered",
 )
@@ -1520,7 +1532,7 @@ if st.session_state.current_user is None and existing_token:
             pass
 
 if st.session_state.current_user is None:
-    st.title("🏋️ 筋トレメモ")
+    render_app_title()
     st.write(f"IDとPWでログインして使います。ログイン状態は {SESSION_HOURS} 時間保持します。")
 
     login_id = st.text_input("ID", key="login_id")
@@ -1534,7 +1546,7 @@ if st.session_state.current_user is None:
             cookies.save()
             st.session_state.current_user = get_user_by_id(user["id"])
             reset_entry_form()
-            st.success("ログインしました。")
+            st.session_state.flash_message = "ログインしました。"
             st.rerun()
         else:
             st.error("IDまたはPWが違います。")
@@ -1545,7 +1557,7 @@ user = st.session_state.current_user
 
 top_left, top_right = st.columns([4, 1])
 with top_left:
-    st.title("🏋️ 筋トレメモ")
+    render_app_title()
     st.caption(
         f'ログイン中: {user["display_name"]} / ID: {user["username"]} / ログイン保持: {SESSION_HOURS}時間'
     )
@@ -1561,6 +1573,10 @@ with top_right:
                 pass
         st.session_state.current_user = None
         st.rerun()
+
+if st.session_state.flash_message:
+    st.success(st.session_state.flash_message)
+    st.session_state.flash_message = None
 
 st.sidebar.title("メニュー")
 page_options = ["入力", "記録一覧", "プロフィール"]

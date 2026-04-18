@@ -1,4 +1,5 @@
 import os
+import io
 import sqlite3
 import hashlib
 from datetime import date, datetime, timedelta
@@ -7,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -16,9 +17,10 @@ ORG_PASSWORD = "VASE"
 CATEGORY_PLACEHOLDER = "選択してください"
 EXERCISE_PLACEHOLDER = "選択してください"
 
-EXERCISE_MASTER = {
+BASE_EXERCISE_MASTER = {
     "胸": [
         "ベンチプレス",
+        "インクラインバーベルプレス",
         "ダンベルフライ",
         "チェストプレス",
         "インクラインダンベルプレス",
@@ -74,6 +76,7 @@ EXERCISE_MASTER = {
         "スカルクラッシャー",
         "ケーブルプッシュダウン",
         "クローズグリップベンチプレス",
+        "トライセプスエクステンション",
         "フレンチプレス",
         "リバースカール",
     ],
@@ -89,10 +92,12 @@ EXERCISE_MASTER = {
         "サイドプランク",
         "バイシクルクランチ",
     ],
+    "その他": [],
 }
 
-EXERCISE_METS = {
+BASE_EXERCISE_METS = {
     "ベンチプレス": 6.0,
+    "インクラインバーベルプレス": 6.0,
     "ダンベルフライ": 5.0,
     "チェストプレス": 5.5,
     "インクラインダンベルプレス": 6.0,
@@ -140,6 +145,7 @@ EXERCISE_METS = {
     "スカルクラッシャー": 5.0,
     "ケーブルプッシュダウン": 5.0,
     "クローズグリップベンチプレス": 6.0,
+    "トライセプスエクステンション": 5.0,
     "フレンチプレス": 5.0,
     "リバースカール": 4.5,
     "クランチ": 4.0,
@@ -161,6 +167,7 @@ CATEGORY_DEFAULT_MET = {
     "肩": 5.3,
     "腕": 4.8,
     "腹筋": 4.5,
+    "その他": None,
 }
 
 
@@ -213,10 +220,10 @@ def column_exists(table_name, column_name):
 
 def infer_category_from_exercise(exercise):
     exercise = (exercise or "").strip()
-    for category, exercises in EXERCISE_MASTER.items():
+    for category, exercises in BASE_EXERCISE_MASTER.items():
         if exercise in exercises:
             return category
-    return list(EXERCISE_MASTER.keys())[0]
+    return "その他"
 
 
 def calculate_age(birthdate_str):
@@ -227,8 +234,7 @@ def calculate_age(birthdate_str):
     except Exception:
         return None
     today = date.today()
-    age = today.year - b.year - ((today.month, today.day) < (b.month, b.day))
-    return age
+    return today.year - b.year - ((today.month, today.day) < (b.month, b.day))
 
 
 def init_db():
@@ -312,11 +318,23 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custom_exercises (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            exercise_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, category, exercise_name)
+        )
+        """
+    )
+
     conn.commit()
 
     if not column_exists("users", "birthdate"):
         cur.execute("ALTER TABLE users ADD COLUMN birthdate TEXT")
-
     if not column_exists("workouts", "body_weight_kg"):
         cur.execute("ALTER TABLE workouts ADD COLUMN body_weight_kg REAL")
 
@@ -328,7 +346,6 @@ def backfill_known_data():
     conn = get_conn()
     cur = conn.cursor()
 
-    # iwasaki の生年月日を自動補正
     cur.execute(
         """
         UPDATE users
@@ -338,7 +355,6 @@ def backfill_known_data():
         """
     )
 
-    # iwasaki の 2026-04-18 workout 体重を 84.00 に自動補正
     cur.execute(
         """
         UPDATE workouts
@@ -374,12 +390,7 @@ def create_session(user_id, hours=SESSION_HOURS):
         INSERT INTO sessions (token, user_id, expires_at, created_at)
         VALUES (?, ?, ?, ?)
         """,
-        (
-            token,
-            user_id,
-            expires_at.isoformat(),
-            utcnow().isoformat(),
-        ),
+        (token, user_id, expires_at.isoformat(), utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -404,14 +415,7 @@ def get_user_from_session(token):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT user_id, expires_at
-        FROM sessions
-        WHERE token = ?
-        """,
-        (token,),
-    )
+    cur.execute("SELECT user_id, expires_at FROM sessions WHERE token = ?", (token,))
     row = cur.fetchone()
     conn.close()
 
@@ -450,49 +454,40 @@ def create_user(username, password, display_name, height_cm, body_weight_kg, bir
     if not username or not password or not display_name:
         return False, "ID・PW・名前は必須です。"
 
-    birthdate_str = None
-    if birthdate:
-        birthdate_str = birthdate.strftime("%Y-%m-%d")
+    birthdate_str = birthdate.strftime("%Y-%m-%d") if birthdate else None
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # 既存IDを大文字小文字を無視してチェック
     cur.execute(
         "SELECT 1 FROM users WHERE lower(username) = lower(?) LIMIT 1",
         (username,),
     )
-    existing = cur.fetchone()
-    if existing is not None:
+    if cur.fetchone() is not None:
         conn.close()
         return False, "そのIDは既に登録されています。"
 
     salt_hex, pwd_hash_hex = hash_password(password)
 
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (
-                username, display_name, height_cm, body_weight_kg, birthdate, password_salt, password_hash, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                username,
-                display_name,
-                float(height_cm) if height_cm and float(height_cm) > 0 else None,
-                float(body_weight_kg) if body_weight_kg and float(body_weight_kg) > 0 else None,
-                birthdate_str,
-                salt_hex,
-                pwd_hash_hex,
-                utcnow().isoformat(),
-            ),
+    cur.execute(
+        """
+        INSERT INTO users (
+            username, display_name, height_cm, body_weight_kg, birthdate, password_salt, password_hash, created_at
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False, "そのIDは既に登録されています。"
-
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            username,
+            display_name,
+            float(height_cm) if height_cm and float(height_cm) > 0 else None,
+            float(body_weight_kg) if body_weight_kg and float(body_weight_kg) > 0 else None,
+            birthdate_str,
+            salt_hex,
+            pwd_hash_hex,
+            utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
     conn.close()
     return True, "アカウントを作成しました。ログインしてください。"
 
@@ -544,13 +539,7 @@ def update_user_profile(user_id, display_name, height_cm, body_weight_kg, birthd
         SET display_name = ?, height_cm = ?, body_weight_kg = ?, birthdate = ?
         WHERE id = ?
         """,
-        (
-            display_name,
-            height_value,
-            weight_value,
-            birthdate_str,
-            user_id,
-        ),
+        (display_name, height_value, weight_value, birthdate_str, user_id),
     )
     conn.commit()
     conn.close()
@@ -562,9 +551,78 @@ def update_user_current_weight(user_id, body_weight_kg):
         return
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("UPDATE users SET body_weight_kg = ? WHERE id = ?", (float(body_weight_kg), user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_custom_exercises(user_id):
+    conn = get_conn()
+    cur = conn.cursor()
     cur.execute(
-        "UPDATE users SET body_weight_kg = ? WHERE id = ?",
-        (float(body_weight_kg), user_id),
+        """
+        SELECT category, exercise_name
+        FROM custom_exercises
+        WHERE user_id = ?
+        ORDER BY category, exercise_name
+        """,
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_exercise_master_for_user(user_id):
+    master = {k: list(v) for k, v in BASE_EXERCISE_MASTER.items()}
+    rows = get_custom_exercises(user_id)
+    for row in rows:
+        category = row["category"]
+        exercise_name = row["exercise_name"]
+        if category not in master:
+            master[category] = []
+        if exercise_name not in master[category]:
+            master[category].append(exercise_name)
+    return master
+
+
+def add_custom_exercise(user_id, category, exercise_name):
+    exercise_name = (exercise_name or "").strip()
+    if not category or not exercise_name:
+        return False, "カテゴリと種目名は必須です。"
+
+    master = get_exercise_master_for_user(user_id)
+    if category in master and exercise_name in master[category]:
+        return False, "その種目は既に存在します。"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO custom_exercises (user_id, category, exercise_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, category, exercise_name, utcnow().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "その種目は既に存在します。"
+
+    conn.close()
+    return True, "種目を追加しました。"
+
+
+def delete_custom_exercise(user_id, category, exercise_name):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM custom_exercises
+        WHERE user_id = ? AND category = ? AND exercise_name = ?
+        """,
+        (user_id, category, exercise_name),
     )
     conn.commit()
     conn.close()
@@ -753,10 +811,7 @@ def upsert_day_note(user_id, workout_date, day_note):
 def delete_day_note(user_id, workout_date):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM day_notes WHERE user_id = ? AND workout_date = ?",
-        (user_id, str(workout_date)),
-    )
+    cur.execute("DELETE FROM day_notes WHERE user_id = ? AND workout_date = ?", (user_id, str(workout_date)))
     conn.commit()
     conn.close()
 
@@ -857,11 +912,9 @@ def best_estimated_1rm(sets_data):
 
 
 def get_exercise_met(category, exercise):
-    if exercise in EXERCISE_METS:
-        return EXERCISE_METS[exercise]
-    if category in CATEGORY_DEFAULT_MET:
-        return CATEGORY_DEFAULT_MET[category]
-    return 5.0
+    if exercise in BASE_EXERCISE_METS:
+        return BASE_EXERCISE_METS[exercise]
+    return None  # カスタム種目は未反映
 
 
 def calculate_workout_metrics(workout, sets_rows):
@@ -890,7 +943,7 @@ def calculate_workout_metrics(workout, sets_rows):
 
     est_kcal = None
     bw = workout["body_weight_kg"]
-    if bw is not None and float(bw) > 0:
+    if met is not None and bw is not None and float(bw) > 0:
         est_kcal = met * float(bw) * (total_seconds / 3600)
 
     return {
@@ -899,6 +952,7 @@ def calculate_workout_metrics(workout, sets_rows):
         "total_sets": total_sets,
         "total_reps": total_reps,
         "est_kcal": est_kcal,
+        "met_supported": met is not None,
     }
 
 
@@ -910,6 +964,7 @@ def calculate_daily_summary(entries):
         "total_reps": 0,
         "est_kcal": 0.0,
         "has_kcal": True,
+        "partial_kcal": False,
     }
 
     for entry in entries:
@@ -921,6 +976,7 @@ def calculate_daily_summary(entries):
 
         if metrics["est_kcal"] is None:
             summary["has_kcal"] = False
+            summary["partial_kcal"] = True
         else:
             summary["est_kcal"] += metrics["est_kcal"]
 
@@ -1126,11 +1182,9 @@ def load_workout_into_form(workout_id):
     workout = get_workout_by_id(workout_id)
     sets_rows = get_sets_for_workout(workout_id)
 
-    category = workout["category"] or infer_category_from_exercise(workout["exercise"])
-
     header = {
         "workout_date": datetime.strptime(workout["workout_date"], "%Y-%m-%d").date(),
-        "category": category,
+        "category": workout["category"] or infer_category_from_exercise(workout["exercise"]),
         "exercise": workout["exercise"],
         "rest_seconds": int(workout["rest_seconds"]),
         "rating": workout["rating"] if workout["rating"] in ["〇", "△", "×"] else "△",
@@ -1269,13 +1323,14 @@ def render_set_block(i):
 
 
 def render_input_page(user):
-    # ここで毎回プロフィール最新体重を初期値化
     current_bw_key = entry_key("body_weight_kg")
     if (
         current_bw_key not in st.session_state
         or float(st.session_state[current_bw_key]) <= 0
     ) and user.get("body_weight_kg") is not None:
         st.session_state[current_bw_key] = float(user["body_weight_kg"])
+
+    exercise_master = get_exercise_master_for_user(user["id"])
 
     if st.session_state.editing_workout_id is not None:
         st.warning("現在、既存記録を修正中です。")
@@ -1287,7 +1342,7 @@ def render_input_page(user):
 
     st.date_input("日付", key=entry_key("workout_date"))
 
-    category_options = [CATEGORY_PLACEHOLDER] + list(EXERCISE_MASTER.keys())
+    category_options = [CATEGORY_PLACEHOLDER] + list(exercise_master.keys())
     st.selectbox("カテゴリ", category_options, key=entry_key("category"))
 
     selected_category = st.session_state[entry_key("category")]
@@ -1296,7 +1351,7 @@ def render_input_page(user):
         exercise_options = [EXERCISE_PLACEHOLDER]
         st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
     else:
-        exercise_options = [EXERCISE_PLACEHOLDER] + EXERCISE_MASTER[selected_category]
+        exercise_options = [EXERCISE_PLACEHOLDER] + exercise_master.get(selected_category, [])
         current_exercise = st.session_state.get(entry_key("exercise"), EXERCISE_PLACEHOLDER)
         if current_exercise not in exercise_options:
             st.session_state[entry_key("exercise")] = EXERCISE_PLACEHOLDER
@@ -1336,6 +1391,9 @@ def render_input_page(user):
         )
     else:
         st.caption("参考値は、補助なし1〜10回・ウォームアップ以外のセットがあると表示します。")
+
+    if selected_exercise not in BASE_EXERCISE_METS and selected_exercise not in ("", EXERCISE_PLACEHOLDER):
+        st.caption("※ デフォルト以外の種目は、消費カロリー計算には反映されません。")
 
     st.selectbox("評価", ["〇", "△", "×"], key=entry_key("rating"))
     st.text_area("種目メモ", key=entry_key("workout_note"), placeholder="任意")
@@ -1433,7 +1491,7 @@ def render_records_page(user):
 
     for workout_date in all_dates:
         day_workouts = [w for w in workouts if w["workout_date"] == workout_date]
-        day_workouts = sorted(day_workouts, key=lambda x: (x["created_at"], x["id"]))  # 古いものが上
+        day_workouts = sorted(day_workouts, key=lambda x: (x["created_at"], x["id"]))
         day_note = day_notes_map.get(workout_date, "")
 
         entries = []
@@ -1454,6 +1512,8 @@ def render_records_page(user):
 
         if daily["has_kcal"]:
             kcal_text = f"{daily['est_kcal']:.0f} kcal"
+        elif daily["partial_kcal"]:
+            kcal_text = f"{daily['est_kcal']:.0f} kcal（一部種目未反映）"
         else:
             kcal_text = "体重未設定の記録あり"
 
@@ -1525,6 +1585,8 @@ def render_records_page(user):
 
                 if metrics["est_kcal"] is not None:
                     st.write(f"推定消費カロリー（参考）: {metrics['est_kcal']:.0f} kcal")
+                elif not metrics["met_supported"]:
+                    st.write("推定消費カロリー（参考）: カスタム種目のため未反映")
                 else:
                     st.write("推定消費カロリー（参考）: 体重未設定")
 
@@ -1568,9 +1630,14 @@ def render_records_page(user):
 def render_stats_page(user):
     st.subheader("統計")
 
-    category_options = list(EXERCISE_MASTER.keys())
-    selected_category = st.selectbox("カテゴリ", category_options, key="stats_category")
-    selected_exercise = st.selectbox("種目", EXERCISE_MASTER[selected_category], key="stats_exercise")
+    exercise_master = get_exercise_master_for_user(user["id"])
+    categories = [c for c in exercise_master.keys() if exercise_master[c]]
+    if not categories:
+        st.info("種目がありません。")
+        return
+
+    selected_category = st.selectbox("カテゴリ", categories, key="stats_category")
+    selected_exercise = st.selectbox("種目", exercise_master[selected_category], key="stats_exercise")
 
     workouts = get_workouts_for_user(user["id"])
     target_workouts = [w for w in workouts if w["exercise"] == selected_exercise]
@@ -1584,10 +1651,7 @@ def render_stats_page(user):
         sets_rows = get_sets_for_workout(workout["id"])
         main_sets = [row for row in sets_rows if not bool(row["is_warmup"])]
 
-        if main_sets:
-            max_weight = max(float(row["weight"]) for row in main_sets)
-        else:
-            max_weight = 0.0
+        max_weight = max((float(row["weight"]) for row in main_sets), default=0.0)
 
         sets_data = [
             {
@@ -1622,51 +1686,270 @@ def render_stats_page(user):
     st.line_chart(df.set_index("date")[["最大セット重量", "推定最大RM"]], use_container_width=True)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    if selected_exercise not in BASE_EXERCISE_METS:
+        st.caption("※ カスタム種目は、消費カロリー計算には反映されません。")
 
-def render_profile_page(user):
-    st.subheader("プロフィール")
 
-    current_name = user["display_name"] or ""
-    current_height = 0.0 if user["height_cm"] is None else float(user["height_cm"])
-    current_weight = 0.0 if user["body_weight_kg"] is None else float(user["body_weight_kg"])
+def render_exercise_editor_page(user):
+    st.subheader("種目編集")
+    st.caption("※ デフォルト以外の種目は、消費カロリー計算には反映されません。")
 
-    current_birthdate = None
-    if user.get("birthdate"):
-        try:
-            current_birthdate = datetime.strptime(user["birthdate"], "%Y-%m-%d").date()
-        except Exception:
-            current_birthdate = None
+    categories = list(BASE_EXERCISE_MASTER.keys())
 
-    age = calculate_age(user.get("birthdate"))
-
-    with st.form("profile_form"):
-        st.text_input("名前", value=current_name, key="profile_name")
-        st.number_input("身長 (cm)", min_value=0.0, step=0.5, value=float(current_height), key="profile_height")
-        st.number_input("体重 (kg)", min_value=0.0, step=0.1, value=float(current_weight), key="profile_weight")
-        st.date_input("生年月日", value=current_birthdate if current_birthdate else date(1990, 1, 1), key="profile_birthdate")
-        submitted = st.form_submit_button("プロフィールを保存")
-
-        if submitted:
-            ok, message = update_user_profile(
-                user["id"],
-                st.session_state["profile_name"],
-                st.session_state["profile_height"],
-                st.session_state["profile_weight"],
-                st.session_state["profile_birthdate"],
-            )
+    with st.form("add_exercise_form"):
+        add_category = st.selectbox("カテゴリ", categories, key="add_exercise_category")
+        add_name = st.text_input("追加する種目名", key="add_exercise_name")
+        add_submitted = st.form_submit_button("種目を追加")
+        if add_submitted:
+            ok, message = add_custom_exercise(user["id"], add_category, add_name)
             if ok:
-                st.session_state.current_user = get_user_by_id(user["id"])
                 st.session_state.flash_message = message
                 st.rerun()
             else:
                 st.error(message)
 
-    if age is not None:
-        st.write(f"年齢: {age}歳")
-    else:
-        st.write("年齢: 未設定")
+    st.markdown("### カスタム種目一覧")
 
-    st.caption("入力ページの体重欄は、ここで保存した体重を初期値として表示します。")
+    custom_rows = get_custom_exercises(user["id"])
+    if not custom_rows:
+        st.info("カスタム種目はまだありません。")
+        return
+
+    for row in custom_rows:
+        c1, c2, c3 = st.columns([2, 4, 2])
+        with c1:
+            st.write(row["category"])
+        with c2:
+            st.write(row["exercise_name"])
+        with c3:
+            if st.button("削除", key=f"delete_custom_{row['category']}_{row['exercise_name']}"):
+                delete_custom_exercise(user["id"], row["category"], row["exercise_name"])
+                st.session_state.flash_message = "カスタム種目を削除しました。"
+                st.rerun()
+
+
+def export_user_backup_bytes(user):
+    workouts = get_workouts_for_user(user["id"])
+
+    workout_rows = []
+    set_rows = []
+    for w in workouts:
+        workout_rows.append(
+            {
+                "export_workout_id": w["id"],
+                "workout_date": w["workout_date"],
+                "category": w["category"],
+                "exercise": w["exercise"],
+                "rest_seconds": w["rest_seconds"],
+                "rating": w["rating"],
+                "workout_note": w["workout_note"],
+                "body_weight_kg": w["body_weight_kg"],
+                "created_at": w["created_at"],
+            }
+        )
+        sets = get_sets_for_workout(w["id"])
+        for s in sets:
+            set_rows.append(
+                {
+                    "export_workout_id": w["id"],
+                    "set_no": s["set_no"],
+                    "weight": s["weight"],
+                    "reps_unassisted": s["reps_unassisted"],
+                    "reps_assisted": s["reps_assisted"],
+                    "is_warmup": s["is_warmup"],
+                }
+            )
+
+    day_notes_map = get_all_day_notes_map(user["id"])
+    day_note_rows = [
+        {"workout_date": d, "day_note": note}
+        for d, note in day_notes_map.items()
+    ]
+
+    custom_rows = [
+        {"category": r["category"], "exercise_name": r["exercise_name"]}
+        for r in get_custom_exercises(user["id"])
+    ]
+
+    profile_rows = [
+        {
+            "display_name": user["display_name"],
+            "height_cm": user["height_cm"],
+            "body_weight_kg": user["body_weight_kg"],
+            "birthdate": user["birthdate"],
+        }
+    ]
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(profile_rows).to_excel(writer, sheet_name="profile", index=False)
+        pd.DataFrame(workout_rows).to_excel(writer, sheet_name="workouts", index=False)
+        pd.DataFrame(set_rows).to_excel(writer, sheet_name="workout_sets", index=False)
+        pd.DataFrame(day_note_rows).to_excel(writer, sheet_name="day_notes", index=False)
+        pd.DataFrame(custom_rows).to_excel(writer, sheet_name="custom_exercises", index=False)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def restore_user_backup(user, uploaded_file):
+    sheets = pd.read_excel(uploaded_file, sheet_name=None)
+
+    required = {"profile", "workouts", "workout_sets", "day_notes", "custom_exercises"}
+    if not required.issubset(set(sheets.keys())):
+        return False, "バックアップファイルの形式が違います。"
+
+    profile_df = sheets["profile"].fillna("")
+    workouts_df = sheets["workouts"].fillna("")
+    workout_sets_df = sheets["workout_sets"].fillna("")
+    day_notes_df = sheets["day_notes"].fillna("")
+    custom_exercises_df = sheets["custom_exercises"].fillna("")
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # 既存データ削除（当ユーザー分のみ）
+    cur.execute(
+        "DELETE FROM workout_sets WHERE workout_id IN (SELECT id FROM workouts WHERE user_id = ?)",
+        (user["id"],),
+    )
+    cur.execute("DELETE FROM workouts WHERE user_id = ?", (user["id"],))
+    cur.execute("DELETE FROM day_notes WHERE user_id = ?", (user["id"],))
+    cur.execute("DELETE FROM custom_exercises WHERE user_id = ?", (user["id"],))
+
+    # プロフィール復元
+    if len(profile_df) > 0:
+        p = profile_df.iloc[0]
+        cur.execute(
+            """
+            UPDATE users
+            SET display_name = ?, height_cm = ?, body_weight_kg = ?, birthdate = ?
+            WHERE id = ?
+            """,
+            (
+                p.get("display_name", ""),
+                None if str(p.get("height_cm", "")) == "" else float(p.get("height_cm")),
+                None if str(p.get("body_weight_kg", "")) == "" else float(p.get("body_weight_kg")),
+                None if str(p.get("birthdate", "")) == "" else str(p.get("birthdate"))[:10],
+                user["id"],
+            ),
+        )
+
+    # custom_exercises 復元
+    for _, row in custom_exercises_df.iterrows():
+        category = str(row.get("category", "")).strip()
+        exercise_name = str(row.get("exercise_name", "")).strip()
+        if category and exercise_name:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO custom_exercises (user_id, category, exercise_name, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user["id"], category, exercise_name, utcnow().isoformat()),
+            )
+
+    # workouts 復元
+    export_id_to_new_id = {}
+    for _, row in workouts_df.iterrows():
+        cur.execute(
+            """
+            INSERT INTO workouts (
+                user_id, workout_date, category, exercise, rest_seconds, rating, workout_note, body_weight_kg, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                str(row.get("workout_date", "")),
+                str(row.get("category", "")),
+                str(row.get("exercise", "")),
+                int(float(row.get("rest_seconds", 90))) if str(row.get("rest_seconds", "")) != "" else 90,
+                str(row.get("rating", "△")) if str(row.get("rating", "")) != "" else "△",
+                str(row.get("workout_note", "")),
+                None if str(row.get("body_weight_kg", "")) == "" else float(row.get("body_weight_kg")),
+                str(row.get("created_at", utcnow().isoformat())),
+            ),
+        )
+        new_id = cur.lastrowid
+        export_id_to_new_id[str(row.get("export_workout_id"))] = new_id
+
+    # sets 復元
+    for _, row in workout_sets_df.iterrows():
+        export_workout_id = str(row.get("export_workout_id"))
+        if export_workout_id not in export_id_to_new_id:
+            continue
+        new_workout_id = export_id_to_new_id[export_workout_id]
+        cur.execute(
+            """
+            INSERT INTO workout_sets (
+                workout_id, set_no, weight, reps_unassisted, reps_assisted, is_warmup, rest_seconds, set_note
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_workout_id,
+                int(float(row.get("set_no", 1))) if str(row.get("set_no", "")) != "" else 1,
+                float(row.get("weight", 0)),
+                int(float(row.get("reps_unassisted", 0))) if str(row.get("reps_unassisted", "")) != "" else 0,
+                int(float(row.get("reps_assisted", 0))) if str(row.get("reps_assisted", "")) != "" else 0,
+                1 if int(float(row.get("is_warmup", 0))) == 1 else 0,
+                0,
+                "",
+            ),
+        )
+
+    # day_notes 復元
+    for _, row in day_notes_df.iterrows():
+        workout_date = str(row.get("workout_date", "")).strip()
+        day_note = str(row.get("day_note", "")).strip()
+        if workout_date:
+            now = utcnow().isoformat()
+            cur.execute(
+                """
+                INSERT INTO day_notes (user_id, workout_date, day_note, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, workout_date)
+                DO UPDATE SET day_note = excluded.day_note, updated_at = excluded.updated_at
+                """,
+                (user["id"], workout_date, day_note, now, now),
+            )
+
+    conn.commit()
+    conn.close()
+    return True, "バックアップを復元しました。"
+
+
+def render_backup_page(user):
+    st.subheader("バックアップ")
+
+    backup_bytes = export_user_backup_bytes(user)
+    st.download_button(
+        label="現在の記録をExcelでダウンロード",
+        data=backup_bytes,
+        file_name=f"training_backup_{user['username']}_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.markdown("### 復元")
+    st.caption("※ 現在の自分の workout / set / 日付メモ / カスタム種目を置き換えます。")
+
+    uploaded_file = st.file_uploader("バックアップExcelを選択", type=["xlsx"], key="backup_uploader")
+    confirm_restore = st.checkbox("現在の記録を上書きして復元することを理解しました。", key="confirm_restore")
+
+    if st.button("バックアップを復元", key="restore_backup_btn", type="primary"):
+        if uploaded_file is None:
+            st.error("Excelファイルを選択してください。")
+        elif not confirm_restore:
+            st.error("確認チェックを入れてください。")
+        else:
+            ok, message = restore_user_backup(user, uploaded_file)
+            if ok:
+                st.session_state.current_user = get_user_by_id(user["id"])
+                st.session_state.flash_message = message
+                reset_entry_form(user=st.session_state.current_user)
+                st.rerun()
+            else:
+                st.error(message)
 
 
 st.set_page_config(
@@ -1828,7 +2111,7 @@ if st.session_state.flash_message:
     st.session_state.flash_message = None
 
 st.sidebar.title("メニュー")
-page_options = ["入力", "記録一覧", "統計", "プロフィール"]
+page_options = ["入力", "記録一覧", "統計", "種目編集", "バックアップ", "プロフィール"]
 current_index = page_options.index(st.session_state.page) if st.session_state.page in page_options else 0
 st.session_state.page = st.sidebar.radio("ページ", page_options, index=current_index)
 
@@ -1838,5 +2121,9 @@ elif st.session_state.page == "記録一覧":
     render_records_page(user)
 elif st.session_state.page == "統計":
     render_stats_page(user)
+elif st.session_state.page == "種目編集":
+    render_exercise_editor_page(user)
+elif st.session_state.page == "バックアップ":
+    render_backup_page(user)
 else:
     render_profile_page(user)

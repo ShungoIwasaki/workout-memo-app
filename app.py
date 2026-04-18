@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -450,14 +450,25 @@ def create_user(username, password, display_name, height_cm, body_weight_kg, bir
     if not username or not password or not display_name:
         return False, "ID・PW・名前は必須です。"
 
-    salt_hex, pwd_hash_hex = hash_password(password)
-
     birthdate_str = None
     if birthdate:
         birthdate_str = birthdate.strftime("%Y-%m-%d")
 
     conn = get_conn()
     cur = conn.cursor()
+
+    # 既存IDを大文字小文字を無視してチェック
+    cur.execute(
+        "SELECT 1 FROM users WHERE lower(username) = lower(?) LIMIT 1",
+        (username,),
+    )
+    existing = cur.fetchone()
+    if existing is not None:
+        conn.close()
+        return False, "そのIDは既に登録されています。"
+
+    salt_hex, pwd_hash_hex = hash_password(password)
+
     try:
         cur.execute(
             """
@@ -480,7 +491,7 @@ def create_user(username, password, display_name, height_cm, body_weight_kg, bir
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
-        return False, "そのIDは既に使われています。"
+        return False, "そのIDは既に登録されています。"
 
     conn.close()
     return True, "アカウントを作成しました。ログインしてください。"
@@ -492,7 +503,7 @@ def authenticate(username, password):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    cur.execute("SELECT * FROM users WHERE lower(username) = lower(?)", (username,))
     user = cur.fetchone()
     conn.close()
 

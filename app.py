@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_cookies_manager import EncryptedCookieManager
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 DB_NAME = "workout_app.db"
 SESSION_COOKIE_NAME = "workout_session_token"
 SESSION_HOURS = 2
@@ -219,6 +219,18 @@ def infer_category_from_exercise(exercise):
     return list(EXERCISE_MASTER.keys())[0]
 
 
+def calculate_age(birthdate_str):
+    if not birthdate_str:
+        return None
+    try:
+        b = datetime.strptime(birthdate_str, "%Y-%m-%d").date()
+    except Exception:
+        return None
+    today = date.today()
+    age = today.year - b.year - ((today.month, today.day) < (b.month, b.day))
+    return age
+
+
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -231,6 +243,7 @@ def init_db():
             display_name TEXT NOT NULL,
             height_cm REAL,
             body_weight_kg REAL,
+            birthdate TEXT,
             password_salt TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL
@@ -301,8 +314,42 @@ def init_db():
 
     conn.commit()
 
+    if not column_exists("users", "birthdate"):
+        cur.execute("ALTER TABLE users ADD COLUMN birthdate TEXT")
+
     if not column_exists("workouts", "body_weight_kg"):
         cur.execute("ALTER TABLE workouts ADD COLUMN body_weight_kg REAL")
+
+    conn.commit()
+    conn.close()
+
+
+def backfill_known_data():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # iwasaki の生年月日を自動補正
+    cur.execute(
+        """
+        UPDATE users
+        SET birthdate = '1994-12-21'
+        WHERE lower(username) = 'iwasaki'
+          AND (birthdate IS NULL OR birthdate = '')
+        """
+    )
+
+    # iwasaki の 2026-04-18 workout 体重を 84.00 に自動補正
+    cur.execute(
+        """
+        UPDATE workouts
+        SET body_weight_kg = 84.0
+        WHERE workout_date = '2026-04-18'
+          AND user_id IN (
+              SELECT id FROM users WHERE lower(username) = 'iwasaki'
+          )
+          AND (body_weight_kg IS NULL OR body_weight_kg = 0)
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -395,7 +442,7 @@ def hash_password(password, salt_hex=None):
     return salt.hex(), pwd_hash.hex()
 
 
-def create_user(username, password, display_name, height_cm, body_weight_kg):
+def create_user(username, password, display_name, height_cm, body_weight_kg, birthdate):
     username = (username or "").strip()
     password = password or ""
     display_name = (display_name or "").strip() or username
@@ -405,21 +452,26 @@ def create_user(username, password, display_name, height_cm, body_weight_kg):
 
     salt_hex, pwd_hash_hex = hash_password(password)
 
+    birthdate_str = None
+    if birthdate:
+        birthdate_str = birthdate.strftime("%Y-%m-%d")
+
     conn = get_conn()
     cur = conn.cursor()
     try:
         cur.execute(
             """
             INSERT INTO users (
-                username, display_name, height_cm, body_weight_kg, password_salt, password_hash, created_at
+                username, display_name, height_cm, body_weight_kg, birthdate, password_salt, password_hash, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
                 display_name,
                 float(height_cm) if height_cm and float(height_cm) > 0 else None,
                 float(body_weight_kg) if body_weight_kg and float(body_weight_kg) > 0 else None,
+                birthdate_str,
                 salt_hex,
                 pwd_hash_hex,
                 utcnow().isoformat(),
@@ -463,11 +515,12 @@ def get_user_by_id(user_id):
     return dict(user) if user else None
 
 
-def update_user_profile(user_id, display_name, height_cm, body_weight_kg):
+def update_user_profile(user_id, display_name, height_cm, body_weight_kg, birthdate):
     display_name = (display_name or "").strip()
 
     height_value = None if height_cm is None or float(height_cm) <= 0 else float(height_cm)
     weight_value = None if body_weight_kg is None or float(body_weight_kg) <= 0 else float(body_weight_kg)
+    birthdate_str = birthdate.strftime("%Y-%m-%d") if birthdate else None
 
     if not display_name:
         return False, "名前は必須です。"
@@ -477,13 +530,14 @@ def update_user_profile(user_id, display_name, height_cm, body_weight_kg):
     cur.execute(
         """
         UPDATE users
-        SET display_name = ?, height_cm = ?, body_weight_kg = ?
+        SET display_name = ?, height_cm = ?, body_weight_kg = ?, birthdate = ?
         WHERE id = ?
         """,
         (
             display_name,
             height_value,
             weight_value,
+            birthdate_str,
             user_id,
         ),
     )
@@ -1204,10 +1258,18 @@ def render_set_block(i):
 
 
 def render_input_page(user):
+    # ここで毎回プロフィール最新体重を初期値化
+    current_bw_key = entry_key("body_weight_kg")
+    if (
+        current_bw_key not in st.session_state
+        or float(st.session_state[current_bw_key]) <= 0
+    ) and user.get("body_weight_kg") is not None:
+        st.session_state[current_bw_key] = float(user["body_weight_kg"])
+
     if st.session_state.editing_workout_id is not None:
         st.warning("現在、既存記録を修正中です。")
         if st.button("修正をやめる", key="cancel_edit"):
-            reset_entry_form(user=user)
+            reset_entry_form(user=st.session_state.current_user)
             st.rerun()
 
     st.subheader("入力")
@@ -1249,6 +1311,7 @@ def render_input_page(user):
                 st.rerun()
 
     st.subheader("セット入力")
+
     for i in range(len(current_sets_model())):
         render_set_block(i)
 
@@ -1447,7 +1510,7 @@ def render_records_page(user):
                 st.write(f"レスト: {workout['rest_seconds']} 秒")
                 st.write(f"評価: {workout['rating']}")
                 if workout["body_weight_kg"] is not None:
-                    st.write(f"体重スナップショット: {float(workout['body_weight_kg']):.1f} kg")
+                    st.write(f"体重スナップショット: {float(workout['body_weight_kg']):.2f} kg")
 
                 if metrics["est_kcal"] is not None:
                     st.write(f"推定消費カロリー（参考）: {metrics['est_kcal']:.0f} kcal")
@@ -1556,10 +1619,20 @@ def render_profile_page(user):
     current_height = 0.0 if user["height_cm"] is None else float(user["height_cm"])
     current_weight = 0.0 if user["body_weight_kg"] is None else float(user["body_weight_kg"])
 
+    current_birthdate = None
+    if user.get("birthdate"):
+        try:
+            current_birthdate = datetime.strptime(user["birthdate"], "%Y-%m-%d").date()
+        except Exception:
+            current_birthdate = None
+
+    age = calculate_age(user.get("birthdate"))
+
     with st.form("profile_form"):
         st.text_input("名前", value=current_name, key="profile_name")
         st.number_input("身長 (cm)", min_value=0.0, step=0.5, value=float(current_height), key="profile_height")
         st.number_input("体重 (kg)", min_value=0.0, step=0.1, value=float(current_weight), key="profile_weight")
+        st.date_input("生年月日", value=current_birthdate if current_birthdate else date(1990, 1, 1), key="profile_birthdate")
         submitted = st.form_submit_button("プロフィールを保存")
 
         if submitted:
@@ -1568,6 +1641,7 @@ def render_profile_page(user):
                 st.session_state["profile_name"],
                 st.session_state["profile_height"],
                 st.session_state["profile_weight"],
+                st.session_state["profile_birthdate"],
             )
             if ok:
                 st.session_state.current_user = get_user_by_id(user["id"])
@@ -1575,6 +1649,11 @@ def render_profile_page(user):
                 st.rerun()
             else:
                 st.error(message)
+
+    if age is not None:
+        st.write(f"年齢: {age}歳")
+    else:
+        st.write("年齢: 未設定")
 
     st.caption("入力ページの体重欄は、ここで保存した体重を初期値として表示します。")
 
@@ -1634,6 +1713,7 @@ if not cookies.ready():
     st.stop()
 
 init_db()
+backfill_known_data()
 cleanup_expired_sessions()
 ensure_app_state()
 
@@ -1691,6 +1771,7 @@ if st.session_state.current_user is None:
         signup_pw = st.text_input("新しいPW", type="password", key="signup_pw")
         signup_height = st.number_input("身長 (cm)", min_value=0.0, step=0.5, key="signup_height")
         signup_weight = st.number_input("体重 (kg)", min_value=0.0, step=0.1, key="signup_weight")
+        signup_birthdate = st.date_input("生年月日", value=date(1990, 1, 1), key="signup_birthdate")
 
         if st.button("新規登録する", key="signup_button"):
             ok, message = create_user(
@@ -1699,6 +1780,7 @@ if st.session_state.current_user is None:
                 signup_name,
                 signup_height,
                 signup_weight,
+                signup_birthdate,
             )
             if ok:
                 st.success(message)
